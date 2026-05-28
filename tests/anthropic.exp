@@ -1,0 +1,28 @@
+#!/usr/bin/env expect
+# Hits the live Anthropic API on a command-not-found path. Requires a valid
+# ANTHROPIC_API_KEY in env.
+set timeout 30
+log_user 0
+
+spawn ./target/debug/mock-terminal anthropic
+expect "Type one or more lines"
+send "Reply with exactly one word.\r"
+send "\r"
+
+expect "shell commands run for real"
+expect "$ "
+send "totally-not-a-real-command-xyz reply with pong\r"
+expect {
+    "asking the LLM" { }
+    timeout { puts "FAIL: fallback not triggered"; exit 1 }
+}
+expect {
+    -re "« .*pong" { puts "PASS: live anthropic reply received" }
+    "backend error" { puts "FAIL: backend error"; exit 1 }
+    timeout { puts "FAIL: timeout waiting for reply"; exit 1 }
+}
+
+expect "$ "
+send "/exit\r"
+expect eof
+puts "PASS: clean exit"

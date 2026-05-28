@@ -1,0 +1,58 @@
+#!/usr/bin/env expect
+# Drive the pty-wrapped terminal:
+#   - system prompt entry
+#   - real shell command (echo)
+#   - persistent shell state (set var, then read it back)
+#   - unknown command -> mock LLM fallback
+set timeout 15
+log_user 0
+
+spawn ./target/debug/mock-terminal
+expect {
+    "Type one or more lines" { }
+    timeout { puts "FAIL: system-prompt banner not seen"; exit 1 }
+}
+
+send "Be terse.\r"
+send "\r"
+
+expect {
+    "shell commands run for real" { puts "PASS: REPL banner shown" }
+    timeout { puts "FAIL: REPL banner not seen"; exit 1 }
+}
+expect "$ "
+
+# Real shell command
+send "echo hello-from-shell\r"
+expect {
+    "hello-from-shell" { puts "PASS: real shell executed echo" }
+    timeout { puts "FAIL: echo output not seen"; exit 1 }
+}
+
+expect "$ "
+# Persistent state across commands
+send "MYVAR=persistent-value\r"
+expect "$ "
+send "echo \"\$MYVAR\"\r"
+expect {
+    "persistent-value" { puts "PASS: shell state persists across commands" }
+    timeout { puts "FAIL: MYVAR did not persist"; exit 1 }
+}
+
+expect "$ "
+# Unknown command -> LLM fallback
+send "totally-not-a-real-command-xyz\r"
+expect {
+    "asking the LLM" { puts "PASS: fallback triggered on exit 127" }
+    timeout { puts "FAIL: fallback not triggered"; exit 1 }
+}
+expect {
+    -re "« .*Be terse" { puts "PASS: mock reply includes system prompt" }
+    -re "« " { puts "PASS: mock reply emitted (no system match)" }
+    timeout { puts "FAIL: no mock reply"; exit 1 }
+}
+
+expect "$ "
+send "/exit\r"
+expect eof
+puts "PASS: clean exit"
