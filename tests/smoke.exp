@@ -3,9 +3,14 @@
 #   - system prompt entry
 #   - real shell command (echo)
 #   - persistent shell state (set var, then read it back)
+#   - a stdin-reading command does not hang (/dev/null redirect)
+#   - a hung command is interrupted and the shell recovers
 #   - unknown command -> mock LLM fallback
 set timeout 15
 log_user 0
+
+# Short timeout so the hung-command recovery case runs quickly.
+set env(MT_TIMEOUT_SECS) 2
 
 spawn ./target/debug/mock-terminal
 expect {
@@ -37,6 +42,27 @@ send "echo \"\$MYVAR\"\r"
 expect {
     "persistent-value" { puts "PASS: shell state persists across commands" }
     timeout { puts "FAIL: MYVAR did not persist"; exit 1 }
+}
+
+expect "$ "
+# A command that reads stdin must not hang (gets EOF from /dev/null).
+send "cat\r"
+expect {
+    "$ " { puts "PASS: stdin-reading command did not hang" }
+    timeout { puts "FAIL: cat hung"; exit 1 }
+}
+
+# A genuinely hung command is interrupted; the shell must stay usable.
+send "sleep 30\r"
+expect {
+    -re "timed out|\\\$ " { puts "PASS: hung command interrupted" }
+    timeout { puts "FAIL: hung command not interrupted"; exit 1 }
+}
+expect "$ "
+send "echo back-after-hang\r"
+expect {
+    "back-after-hang" { puts "PASS: shell recovered after hang" }
+    timeout { puts "FAIL: shell wedged after hang"; exit 1 }
 }
 
 expect "$ "

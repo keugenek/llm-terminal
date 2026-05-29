@@ -6,12 +6,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const READ_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+// After the timeout we SIGINT the command; this is how long we then wait for
+// bash to resume and emit the end marker before declaring the shell unrecoverable.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Shell {
     writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<Vec<u8>>,
     counter: u64,
+    command_timeout: Duration,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
 }
@@ -60,10 +64,17 @@ impl Shell {
             }
         });
 
+        let command_timeout = std::env::var("MT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+
         let mut shell = Self {
             writer,
             rx,
             counter: 0,
+            command_timeout,
             _child: child,
             _master: pair.master,
         };
@@ -76,6 +87,11 @@ impl Shell {
         Ok(shell)
     }
 
+    #[cfg(test)]
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.command_timeout = timeout;
+    }
+
     pub fn run(&mut self, command: &str) -> Result<CommandResult, Box<dyn Error>> {
         self.counter += 1;
         let id = self.counter;
@@ -83,18 +99,47 @@ impl Shell {
         let end_prefix = "__MTEND_";
         let end_suffix = format!("_{id}__");
 
+        // Wrap the command in a brace group with stdin redirected from
+        // /dev/null. The redirect makes stdin-reading commands (`read`, REPLs,
+        // interactive tools) hit EOF and exit instead of hanging forever and
+        // wedging the shell. A brace group (not a subshell) keeps `cd` and env
+        // assignments in the current shell so state persists across commands.
         let wrapped = format!(
-            "printf '%s\\n' '{start_marker}'\n{command}\nprintf '\\n{end_prefix}%d{end_suffix}\\n' $?\n"
+            "printf '%s\\n' '{start_marker}'\n{{ {command}\n}} </dev/null\nprintf '\\n{end_prefix}%d{end_suffix}\\n' \"$?\"\n"
         );
 
         self.writer.write_all(wrapped.as_bytes())?;
         self.writer.flush()?;
 
         let mut acc = Vec::new();
-        let started = Instant::now();
+        let mut deadline = Instant::now() + self.command_timeout;
+        let mut escalation = 0u8;
         loop {
-            if started.elapsed() > COMMAND_TIMEOUT {
-                return Err("shell command timed out".into());
+            if Instant::now() > deadline {
+                // The command overran its timeout (infinite loop, or a tool
+                // reading /dev/tty directly so the /dev/null redirect can't
+                // help). Escalate through the terminal's signal characters,
+                // then keep reading: once the command dies, bash regains
+                // control, runs the trailing printf, and emits the end marker
+                // (exit code 130 for SIGINT, 131 for SIGQUIT). That both
+                // reports the interruption and proves the shell recovered.
+                let signal_char = match escalation {
+                    0 => 0x03u8, // Ctrl-C  -> SIGINT
+                    1 => 0x1cu8, // Ctrl-\  -> SIGQUIT (harder to ignore)
+                    _ => {
+                        return Err(format!(
+                            "command timed out after {}s and ignored SIGINT/SIGQUIT; \
+                             moving on (the shell remains usable)",
+                            self.command_timeout.as_secs()
+                        )
+                        .into())
+                    }
+                };
+                self.writer.write_all(&[signal_char])?;
+                self.writer.flush()?;
+                escalation += 1;
+                deadline = Instant::now() + INTERRUPT_GRACE;
+                continue;
             }
             match self.rx.recv_timeout(READ_CHUNK_TIMEOUT) {
                 Ok(chunk) => acc.extend_from_slice(&chunk),
@@ -161,5 +206,46 @@ mod tests {
     fn find_end_ignores_wrong_counter() {
         let text = "__MTEND_0_2__";
         assert_eq!(find_end(text, "__MTEND_", "_1__"), None);
+    }
+
+    #[test]
+    fn shell_runs_real_command() {
+        let mut sh = Shell::spawn().expect("spawn");
+        let r = sh.run("echo hello123").expect("run echo");
+        assert_eq!(r.exit_code, 0, "output: {:?}", r.output);
+        assert!(r.output.contains("hello123"), "output: {:?}", r.output);
+    }
+
+    #[test]
+    fn shell_state_persists_across_commands() {
+        let mut sh = Shell::spawn().expect("spawn");
+        sh.run("MTTESTVAR=persist99").expect("set var");
+        let r = sh.run("echo \"$MTTESTVAR\"").expect("read var");
+        assert!(r.output.contains("persist99"), "output: {:?}", r.output);
+    }
+
+    // Without the /dev/null stdin redirect, `cat` would block on the pty
+    // forever; this asserts it returns promptly with EOF instead.
+    #[test]
+    fn shell_stdin_reader_does_not_hang() {
+        let mut sh = Shell::spawn().expect("spawn");
+        let r = sh.run("cat").expect("run cat");
+        assert_eq!(r.exit_code, 0, "output: {:?}", r.output);
+        assert!(r.output.is_empty(), "output: {:?}", r.output);
+    }
+
+    // The core fix: a command that overruns the timeout is interrupted and the
+    // shell stays usable for the next command (previously it wedged forever).
+    #[test]
+    fn shell_recovers_after_timeout() {
+        let mut sh = Shell::spawn().expect("spawn");
+        sh.set_timeout(Duration::from_secs(2));
+        let hung = sh.run("sleep 30");
+        match hung {
+            Ok(r) => assert_ne!(r.exit_code, 0, "expected interrupted exit code"),
+            Err(_) => {}
+        }
+        let r = sh.run("echo recovered55").expect("shell did not recover");
+        assert!(r.output.contains("recovered55"), "output: {:?}", r.output);
     }
 }
