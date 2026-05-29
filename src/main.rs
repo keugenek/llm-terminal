@@ -52,7 +52,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         backend.name()
     );
     println!(
-        "Interactive programs (isaac, claude, vim, top, python…) run in passthrough; \
+        "Interactive programs (claude, vim, top, python…) run in passthrough; \
          prefix any command with ':' to force it."
     );
     if auto_accept {
@@ -83,9 +83,8 @@ fn interactive_command(input: &str) -> Option<&str> {
         return (!rest.is_empty()).then_some(rest);
     }
     const INTERACTIVE: &[&str] = &[
-        "isaac", "claude", "vim", "vi", "nvim", "nano", "emacs", "top", "htop", "less", "more",
-        "man", "ssh", "python", "python3", "ipython", "node", "irb", "psql", "mysql", "tmux",
-        "screen",
+        "claude", "vim", "vi", "nvim", "nano", "emacs", "top", "htop", "less", "more", "man",
+        "ssh", "python", "python3", "ipython", "node", "irb", "psql", "mysql", "tmux", "screen",
     ];
     let first = input.split_whitespace().next().unwrap_or("");
     let base = first.rsplit('/').next().unwrap_or(first);
@@ -295,7 +294,6 @@ mod tests {
 
     #[test]
     fn known_interactive_program_routes_to_passthrough() {
-        assert_eq!(interactive_command("isaac"), Some("isaac"));
         assert_eq!(interactive_command("claude"), Some("claude"));
         assert_eq!(interactive_command("vim file.txt"), Some("vim file.txt"));
         assert_eq!(interactive_command("/usr/bin/python3"), Some("/usr/bin/python3"));

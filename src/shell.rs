@@ -17,9 +17,9 @@ const KILL_TOTAL_GRACE: Duration = Duration::from_secs(5);
 
 // Auto-accept tuning. We inject Enter either when the program goes quiet after
 // showing a prompt (IDLE), or — for animated TUIs that never go quiet, like
-// isaac/Claude Code — once the prompt has been on screen long enough to have
-// finished rendering (SETTLE). COOLDOWN is the minimum gap between injections;
-// TAIL is how many trailing output bytes we scan for prompt patterns.
+// Claude Code — once the prompt has been on screen long enough to have finished
+// rendering (SETTLE). COOLDOWN is the minimum gap between injections; TAIL is
+// how many trailing output bytes we scan for prompt patterns.
 const AUTO_ACCEPT_IDLE: Duration = Duration::from_millis(600);
 const AUTO_ACCEPT_SETTLE: Duration = Duration::from_millis(1200);
 const AUTO_ACCEPT_COOLDOWN: Duration = Duration::from_millis(1500);
@@ -166,7 +166,7 @@ impl Shell {
                     // process group, so a tty signal could hit bash too and
                     // wedge it. Killing by PID only ever targets the command's
                     // descendants. SIGKILL also can't be ignored, so it works on
-                    // tools that grab the pty in raw mode (e.g. dbexec/isaac).
+                    // tools that grab the pty in raw mode and swallow tty signals.
                     interrupted = true;
                     killing = true;
                     deadline = Instant::now() + KILL_TOTAL_GRACE;
@@ -219,7 +219,7 @@ impl Shell {
     }
 
     /// Run `command` interactively: hand the inner pty straight to the outer
-    /// terminal so full-screen / REPL programs (isaac, vim, top, python) work
+    /// terminal so full-screen / REPL programs (claude, vim, top, python) work
     /// for real. Forwards raw bytes both ways until the command's process tree
     /// exits, then resynchronises back to capture mode.
     ///
@@ -294,7 +294,7 @@ impl Shell {
 
             // Auto-accept: inject Enter to take the default once a prompt is up.
             // Fire when the program goes idle after the prompt, OR — for animated
-            // TUIs that never go idle (isaac/Claude Code redraw a spinner, hints,
+            // TUIs that never go idle (Claude Code redraws a spinner, hints,
             // cursor) — once the prompt has been on screen long enough to have
             // finished rendering.
             if auto_accept {
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn auto_accept_flag_untouched_for_unknown_program() {
-        assert_eq!(with_auto_accept_flag("isaac"), "isaac");
+        assert_eq!(with_auto_accept_flag("top"), "top");
         assert_eq!(with_auto_accept_flag("vim a.txt"), "vim a.txt");
     }
 
