@@ -44,9 +44,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut shell = Shell::spawn()?;
 
     println!(
-        "mock-terminal — backend: {} — shell commands run for real; unknown commands go to the LLM. /exit to quit.",
+        "mock-terminal — backend: {} — shell commands run for real; unknown commands go to the LLM.",
         backend.name()
     );
+    println!("Ctrl-C interrupts a running command; /exit quits.");
 
     enable_raw_mode()?;
     let result = repl(&mut shell, &*backend, &system_prompt);
@@ -80,6 +81,26 @@ fn repl(
     system: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = stdout();
+
+    // Polled by `shell.run` while a command executes. The command's own stdin is
+    // /dev/null, so keystrokes here reach us, not the command — we watch for
+    // Ctrl-C to tear the command down. Other keys pressed mid-command are
+    // drained and ignored (you can't type the next command until this returns).
+    let mut poll_ctrl_c = || -> bool {
+        let mut hit = false;
+        while event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+            if let Ok(Event::Key(k)) = event::read() {
+                if k.kind == KeyEventKind::Press
+                    && k.code == KeyCode::Char('c')
+                    && k.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    hit = true;
+                }
+            }
+        }
+        hit
+    };
+
     loop {
         execute!(out, SetForegroundColor(Color::Cyan), Print("$ "), ResetColor)?;
         out.flush()?;
@@ -101,12 +122,14 @@ fn repl(
             break;
         }
 
-        match shell.run(trimmed) {
+        match shell.run(trimmed, &mut poll_ctrl_c) {
             Ok(result) => {
                 if !result.output.is_empty() {
                     print_block(&mut out, &result.output)?;
                 }
-                if result.exit_code == NOT_FOUND_EXIT_CODE {
+                if result.interrupted {
+                    print_styled(&mut out, Color::Yellow, "· interrupted")?;
+                } else if result.exit_code == NOT_FOUND_EXIT_CODE {
                     print_styled(
                         &mut out,
                         Color::Yellow,
@@ -145,12 +168,15 @@ fn read_line(out: &mut impl Write) -> Result<Option<String>, Box<dyn std::error:
                     }
                 }
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Cancel the current line (like a real shell), don't exit.
+                    // The empty string makes the REPL draw a fresh prompt.
                     execute!(out, Print("^C"))?;
-                    return Ok(None);
+                    return Ok(Some(String::new()));
                 }
                 KeyCode::Char('d')
                     if k.modifiers.contains(KeyModifiers::CONTROL) && buf.is_empty() =>
                 {
+                    // Ctrl-D on an empty line is EOF -> exit.
                     return Ok(None);
                 }
                 KeyCode::Char(c) => {

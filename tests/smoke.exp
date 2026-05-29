@@ -52,10 +52,10 @@ expect {
     timeout { puts "FAIL: cat hung"; exit 1 }
 }
 
-# A genuinely hung command is interrupted; the shell must stay usable.
+# A genuinely hung command is killed on timeout; the shell must stay usable.
 send "sleep 30\r"
 expect {
-    -re "timed out|\\\$ " { puts "PASS: hung command interrupted" }
+    "interrupted" { puts "PASS: hung command interrupted on timeout" }
     timeout { puts "FAIL: hung command not interrupted"; exit 1 }
 }
 expect "$ "
@@ -63,6 +63,24 @@ send "echo back-after-hang\r"
 expect {
     "back-after-hang" { puts "PASS: shell recovered after hang" }
     timeout { puts "FAIL: shell wedged after hang"; exit 1 }
+}
+expect "$ "
+
+# Manual Ctrl-C must interrupt a running command well before the timeout.
+send "sleep 30\r"
+# Wait for the command to actually start before interrupting it.
+expect "sleep 30"
+sleep 1
+send "\x03"
+expect {
+    "interrupted" { puts "PASS: Ctrl-C interrupted a running command" }
+    timeout { puts "FAIL: Ctrl-C did not interrupt"; exit 1 }
+}
+expect "$ "
+send "echo back-after-ctrlc\r"
+expect {
+    "back-after-ctrlc" { puts "PASS: shell recovered after Ctrl-C" }
+    timeout { puts "FAIL: shell wedged after Ctrl-C"; exit 1 }
 }
 
 expect "$ "

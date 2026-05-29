@@ -1,21 +1,26 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::error::Error;
 use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const READ_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-// After the timeout we SIGINT the command; this is how long we then wait for
-// bash to resume and emit the end marker before declaring the shell unrecoverable.
-const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+// While tearing a command down, re-issue SIGKILL this often. Retrying re-scans
+// the process tree, catching a child that had not yet forked on the first try.
+const KILL_RETRY: Duration = Duration::from_millis(250);
+// Total time to keep SIGKILL-ing and waiting for bash to reap the tree and emit
+// the end marker before declaring the shell unrecoverable.
+const KILL_TOTAL_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Shell {
     writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<Vec<u8>>,
     counter: u64,
     command_timeout: Duration,
+    child_pid: Option<u32>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
 }
@@ -23,6 +28,9 @@ pub struct Shell {
 pub struct CommandResult {
     pub output: String,
     pub exit_code: i32,
+    /// True if the command was cut short (by the user or the timeout) rather
+    /// than finishing on its own.
+    pub interrupted: bool,
 }
 
 impl Shell {
@@ -43,6 +51,7 @@ impl Shell {
         cmd.env("TERM", "dumb");
 
         let child = pair.slave.spawn_command(cmd)?;
+        let child_pid = child.process_id();
         drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
@@ -75,6 +84,7 @@ impl Shell {
             rx,
             counter: 0,
             command_timeout,
+            child_pid,
             _child: child,
             _master: pair.master,
         };
@@ -92,7 +102,16 @@ impl Shell {
         self.command_timeout = timeout;
     }
 
-    pub fn run(&mut self, command: &str) -> Result<CommandResult, Box<dyn Error>> {
+    /// Run `command`, blocking until it finishes, is interrupted, or times out.
+    ///
+    /// `user_interrupt` is polled each iteration; when it returns true (the user
+    /// pressed Ctrl-C in the outer terminal) the running command is torn down
+    /// immediately. The same teardown path fires automatically on timeout.
+    pub fn run(
+        &mut self,
+        command: &str,
+        user_interrupt: &mut dyn FnMut() -> bool,
+    ) -> Result<CommandResult, Box<dyn Error>> {
         self.counter += 1;
         let id = self.counter;
         let start_marker = format!("__MTSTART_{id}__");
@@ -111,36 +130,56 @@ impl Shell {
         self.writer.write_all(wrapped.as_bytes())?;
         self.writer.flush()?;
 
+        let started_marker = format!("{start_marker}\n");
         let mut acc = Vec::new();
+        // Until the start marker appears, bash is still reading the command;
+        // interrupting now would SIGINT bash itself (it shares the command's
+        // process group) and discard the trailing printf, wedging the shell.
+        // So gate all teardown on `started`, and measure the timeout from when
+        // the command actually begins running.
+        let mut started = false;
         let mut deadline = Instant::now() + self.command_timeout;
-        let mut escalation = 0u8;
+        // Once we decide to tear the command down, we SIGKILL its process tree
+        // (never bash) and keep retrying until the end marker proves it died.
+        let mut killing = false;
+        let mut last_kill = Instant::now();
+        let mut interrupted = false;
         loop {
-            if Instant::now() > deadline {
-                // The command overran its timeout (infinite loop, or a tool
-                // reading /dev/tty directly so the /dev/null redirect can't
-                // help). Escalate through the terminal's signal characters,
-                // then keep reading: once the command dies, bash regains
-                // control, runs the trailing printf, and emits the end marker
-                // (exit code 130 for SIGINT, 131 for SIGQUIT). That both
-                // reports the interruption and proves the shell recovered.
-                let signal_char = match escalation {
-                    0 => 0x03u8, // Ctrl-C  -> SIGINT
-                    1 => 0x1cu8, // Ctrl-\  -> SIGQUIT (harder to ignore)
-                    _ => {
-                        return Err(format!(
-                            "command timed out after {}s and ignored SIGINT/SIGQUIT; \
-                             moving on (the shell remains usable)",
-                            self.command_timeout.as_secs()
-                        )
-                        .into())
+            if !started {
+                if Instant::now() > deadline {
+                    return Err("shell did not acknowledge the command (not responding)".into());
+                }
+            } else if !killing {
+                if user_interrupt() || Instant::now() > deadline {
+                    // Tear the command down with a real SIGKILL of its process
+                    // tree rather than a tty Ctrl-C: the command shares bash's
+                    // process group, so a tty signal could hit bash too and
+                    // wedge it. Killing by PID only ever targets the command's
+                    // descendants. SIGKILL also can't be ignored, so it works on
+                    // tools that grab the pty in raw mode (e.g. dbexec/isaac).
+                    interrupted = true;
+                    killing = true;
+                    deadline = Instant::now() + KILL_TOTAL_GRACE;
+                    if let Some(pid) = self.child_pid {
+                        kill_descendants(pid);
                     }
-                };
-                self.writer.write_all(&[signal_char])?;
-                self.writer.flush()?;
-                escalation += 1;
-                deadline = Instant::now() + INTERRUPT_GRACE;
-                continue;
+                    last_kill = Instant::now();
+                    continue;
+                }
+            } else {
+                if Instant::now() > deadline {
+                    return Err("command did not terminate after repeated SIGKILL; \
+                                the shell may be unusable"
+                        .into());
+                }
+                if last_kill.elapsed() >= KILL_RETRY {
+                    if let Some(pid) = self.child_pid {
+                        kill_descendants(pid);
+                    }
+                    last_kill = Instant::now();
+                }
             }
+
             match self.rx.recv_timeout(READ_CHUNK_TIMEOUT) {
                 Ok(chunk) => acc.extend_from_slice(&chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -150,6 +189,10 @@ impl Shell {
             }
 
             let text = String::from_utf8_lossy(&acc);
+            if !started && text.contains(&started_marker) {
+                started = true;
+                deadline = Instant::now() + self.command_timeout;
+            }
             if let Some((end_idx, code)) = find_end(&text, end_prefix, &end_suffix) {
                 let body_start = text
                     .find(&format!("{start_marker}\n"))
@@ -159,9 +202,42 @@ impl Shell {
                 return Ok(CommandResult {
                     output,
                     exit_code: code,
+                    interrupted,
                 });
             }
         }
+    }
+}
+
+/// SIGKILL every descendant of `root` (typically the wrapped bash), deepest
+/// first, leaving `root` itself alive. Used to forcibly stop a command tree
+/// that ignores tty signals. Processes that detached into their own session
+/// (e.g. background daemons) are intentionally not reached by the `pgrep -P`
+/// walk and are left running.
+fn kill_descendants(root: u32) {
+    let mut stack = vec![root];
+    let mut victims = Vec::new();
+    while let Some(pid) = stack.pop() {
+        let out = match Command::new("pgrep").arg("-P").arg(pid.to_string()).output() {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        for token in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            if let Ok(child) = token.parse::<u32>() {
+                victims.push(child);
+                stack.push(child);
+            }
+        }
+    }
+    for pid in victims.iter().rev() {
+        // Ignore failures: a child may have exited between the pgrep scan and
+        // here. Silence stdio so "No such process" never leaks to our terminal.
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -208,19 +284,24 @@ mod tests {
         assert_eq!(find_end(text, "__MTEND_", "_1__"), None);
     }
 
+    fn never() -> impl FnMut() -> bool {
+        || false
+    }
+
     #[test]
     fn shell_runs_real_command() {
         let mut sh = Shell::spawn().expect("spawn");
-        let r = sh.run("echo hello123").expect("run echo");
+        let r = sh.run("echo hello123", &mut never()).expect("run echo");
         assert_eq!(r.exit_code, 0, "output: {:?}", r.output);
+        assert!(!r.interrupted);
         assert!(r.output.contains("hello123"), "output: {:?}", r.output);
     }
 
     #[test]
     fn shell_state_persists_across_commands() {
         let mut sh = Shell::spawn().expect("spawn");
-        sh.run("MTTESTVAR=persist99").expect("set var");
-        let r = sh.run("echo \"$MTTESTVAR\"").expect("read var");
+        sh.run("MTTESTVAR=persist99", &mut never()).expect("set var");
+        let r = sh.run("echo \"$MTTESTVAR\"", &mut never()).expect("read var");
         assert!(r.output.contains("persist99"), "output: {:?}", r.output);
     }
 
@@ -229,23 +310,47 @@ mod tests {
     #[test]
     fn shell_stdin_reader_does_not_hang() {
         let mut sh = Shell::spawn().expect("spawn");
-        let r = sh.run("cat").expect("run cat");
+        let r = sh.run("cat", &mut never()).expect("run cat");
         assert_eq!(r.exit_code, 0, "output: {:?}", r.output);
         assert!(r.output.is_empty(), "output: {:?}", r.output);
     }
 
-    // The core fix: a command that overruns the timeout is interrupted and the
-    // shell stays usable for the next command (previously it wedged forever).
+    // A command that overruns the timeout is interrupted and the shell stays
+    // usable for the next command (previously it wedged forever).
     #[test]
     fn shell_recovers_after_timeout() {
         let mut sh = Shell::spawn().expect("spawn");
         sh.set_timeout(Duration::from_secs(2));
-        let hung = sh.run("sleep 30");
-        match hung {
-            Ok(r) => assert_ne!(r.exit_code, 0, "expected interrupted exit code"),
-            Err(_) => {}
+        let hung = sh.run("sleep 30", &mut never());
+        if let Ok(r) = hung {
+            assert!(r.interrupted, "expected interrupted flag");
+            assert_ne!(r.exit_code, 0, "expected non-zero interrupted exit code");
         }
-        let r = sh.run("echo recovered55").expect("shell did not recover");
+        let r = sh
+            .run("echo recovered55", &mut never())
+            .expect("shell did not recover");
         assert!(r.output.contains("recovered55"), "output: {:?}", r.output);
+    }
+
+    // The user pressing Ctrl-C must stop a running command well before the
+    // timeout would, and the shell must remain usable afterwards.
+    #[test]
+    fn shell_user_interrupt_stops_command() {
+        let mut sh = Shell::spawn().expect("spawn");
+        sh.set_timeout(Duration::from_secs(60));
+        let start = Instant::now();
+        // Request interruption on the very first poll.
+        let r = sh
+            .run("sleep 60", &mut || true)
+            .expect("interrupt should yield a result");
+        assert!(r.interrupted, "expected interrupted flag");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "interrupt should be far faster than the 60s timeout"
+        );
+        let r = sh
+            .run("echo back66", &mut never())
+            .expect("shell did not recover");
+        assert!(r.output.contains("back66"), "output: {:?}", r.output);
     }
 }
