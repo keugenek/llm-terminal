@@ -5,7 +5,7 @@ set timeout 30
 log_user 0
 
 spawn ./target/debug/mock-terminal anthropic
-expect "Type one or more lines"
+expect "SYSTEM PROMPT"
 send "Reply with exactly one word.\r"
 send "\r"
 

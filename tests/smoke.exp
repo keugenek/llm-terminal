@@ -14,9 +14,10 @@ set env(MT_TIMEOUT_SECS) 2
 
 spawn ./target/debug/mock-terminal
 expect {
-    "Type one or more lines" { }
-    timeout { puts "FAIL: system-prompt banner not seen"; exit 1 }
+    "SYSTEM PROMPT" { }
+    timeout { puts "FAIL: system-prompt request not seen"; exit 1 }
 }
+expect "system prompt>"
 
 send "Be terse.\r"
 send "\r"

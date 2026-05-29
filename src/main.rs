@@ -26,9 +26,22 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let backend_kind = std::env::args().nth(1).unwrap_or_else(|| "mock".to_string());
 
-    println!("System prompt — used when shell can't find a command.");
-    println!("Type one or more lines, then submit an empty line. Leave blank for none.");
+    println!("════════════════════════════════════════════════════════════════");
+    println!(" Set a SYSTEM PROMPT for this session (optional).");
+    println!(" It does two things:");
+    println!("   • Gives the LLM context when a typed command isn't found.");
+    println!("   • Include the word \"accept\" (e.g. type:  accept requests )");
+    println!("     to auto-approve prompts from interactive programs like claude.");
+    println!();
+    println!(" Type your prompt below. Press Enter on an EMPTY line to start.");
+    println!(" (Just press Enter now to skip — no system prompt.)");
+    println!("════════════════════════════════════════════════════════════════");
     let system_prompt = read_multiline_prompt()?;
+    if system_prompt.is_empty() {
+        println!("→ No system prompt set.");
+    } else {
+        println!("→ System prompt set ({} chars).", system_prompt.len());
+    }
 
     let backend: Box<dyn Backend> = match backend_kind.as_str() {
         "anthropic" | "claude" => match AnthropicBackend::from_env() {
@@ -97,6 +110,9 @@ fn read_multiline_prompt() -> std::io::Result<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut line = String::new();
     loop {
+        // A visible indicator so it's obvious the program is waiting for input.
+        print!("system prompt> ");
+        std::io::stdout().flush()?;
         line.clear();
         let n = handle.read_line(&mut line)?;
         if n == 0 {
