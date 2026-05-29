@@ -547,6 +547,13 @@ mod tests {
         assert!(!looks_like_prompt(""));
     }
 
+    // A Claude-Code-style multi-option menu with the default marked by '❯'.
+    #[test]
+    fn prompt_detection_option_menu() {
+        let menu = "Which option would you like to pick?\n\n❯ 1. Option A\n  2. Option B\n  3. Option C\n";
+        assert!(looks_like_prompt(menu));
+    }
+
     #[test]
     fn shell_runs_real_command() {
         let mut sh = Shell::spawn().expect("spawn");
