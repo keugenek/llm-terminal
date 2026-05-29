@@ -47,12 +47,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "mock-terminal — backend: {} — shell commands run for real; unknown commands go to the LLM.",
         backend.name()
     );
+    println!(
+        "Interactive programs (isaac, vim, top, python…) run in passthrough; \
+         prefix any command with ':' to force it."
+    );
     println!("Ctrl-C interrupts a running command; /exit quits.");
 
     enable_raw_mode()?;
     let result = repl(&mut shell, &*backend, &system_prompt);
     disable_raw_mode()?;
     result
+}
+
+/// Decide whether `input` should run in interactive passthrough rather than
+/// capture mode. A leading `:` forces passthrough for any command; otherwise a
+/// known interactive program name (matched on the first token's basename)
+/// triggers it. Returns the command to run, or `None` for capture mode.
+fn interactive_command(input: &str) -> Option<&str> {
+    if let Some(rest) = input.strip_prefix(':') {
+        let rest = rest.trim();
+        return (!rest.is_empty()).then_some(rest);
+    }
+    const INTERACTIVE: &[&str] = &[
+        "isaac", "vim", "vi", "nvim", "nano", "emacs", "top", "htop", "less", "more", "man",
+        "ssh", "python", "python3", "ipython", "node", "irb", "psql", "mysql", "tmux", "screen",
+    ];
+    let first = input.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    INTERACTIVE.contains(&base).then_some(input)
 }
 
 fn read_multiline_prompt() -> std::io::Result<String> {
@@ -120,6 +142,13 @@ fn repl(
         }
         if trimmed == "/exit" || trimmed == "/quit" {
             break;
+        }
+
+        // Interactive programs take over the terminal: hand the inner pty
+        // straight through instead of capturing output.
+        if let Some(cmd) = interactive_command(trimmed) {
+            shell.run_interactive(cmd)?;
+            continue;
         }
 
         match shell.run(trimmed, &mut poll_ctrl_c) {
@@ -233,4 +262,31 @@ fn print_styled(
     )?;
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interactive_command;
+
+    #[test]
+    fn known_interactive_program_routes_to_passthrough() {
+        assert_eq!(interactive_command("isaac"), Some("isaac"));
+        assert_eq!(interactive_command("vim file.txt"), Some("vim file.txt"));
+        assert_eq!(interactive_command("/usr/bin/python3"), Some("/usr/bin/python3"));
+    }
+
+    #[test]
+    fn ordinary_command_stays_in_capture_mode() {
+        assert_eq!(interactive_command("ls -la"), None);
+        assert_eq!(interactive_command("echo hi"), None);
+        // Substring of a known name must not match.
+        assert_eq!(interactive_command("vimdiff a b"), None);
+    }
+
+    #[test]
+    fn colon_prefix_forces_passthrough() {
+        assert_eq!(interactive_command(":ls -la"), Some("ls -la"));
+        assert_eq!(interactive_command(": cat"), Some("cat"));
+        assert_eq!(interactive_command(":"), None);
+    }
 }

@@ -355,6 +355,7 @@ name = "mock-terminal"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "libc",
  "portable-pty",
  "serde_json",
  "ureq",

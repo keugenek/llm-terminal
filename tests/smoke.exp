@@ -82,6 +82,24 @@ expect {
     "back-after-ctrlc" { puts "PASS: shell recovered after Ctrl-C" }
     timeout { puts "FAIL: shell wedged after Ctrl-C"; exit 1 }
 }
+expect "$ "
+
+# Interactive passthrough: ':cat' runs cat attached to the terminal; it echoes
+# typed input, and Ctrl-D exits it and returns to capture mode.
+send ":cat\r"
+sleep 1
+send "echo-through-cat\r"
+expect {
+    "echo-through-cat" { puts "PASS: interactive passthrough forwarded I/O" }
+    timeout { puts "FAIL: passthrough produced no output"; exit 1 }
+}
+send "\x04"
+expect "$ "
+send "echo back-after-passthrough\r"
+expect {
+    "back-after-passthrough" { puts "PASS: capture mode resumed after passthrough" }
+    timeout { puts "FAIL: capture mode broken after passthrough"; exit 1 }
+}
 
 expect "$ "
 # Unknown command -> LLM fallback
