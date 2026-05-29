@@ -15,12 +15,15 @@ const KILL_RETRY: Duration = Duration::from_millis(250);
 // the end marker before declaring the shell unrecoverable.
 const KILL_TOTAL_GRACE: Duration = Duration::from_secs(5);
 
-// Auto-accept tuning: how quiet the program must go after showing a prompt
-// before we inject Enter, the minimum gap between injections, and how many
-// trailing output bytes to scan for prompt patterns.
+// Auto-accept tuning. We inject Enter either when the program goes quiet after
+// showing a prompt (IDLE), or — for animated TUIs that never go quiet, like
+// isaac/Claude Code — once the prompt has been on screen long enough to have
+// finished rendering (SETTLE). COOLDOWN is the minimum gap between injections;
+// TAIL is how many trailing output bytes we scan for prompt patterns.
 const AUTO_ACCEPT_IDLE: Duration = Duration::from_millis(600);
+const AUTO_ACCEPT_SETTLE: Duration = Duration::from_millis(1200);
 const AUTO_ACCEPT_COOLDOWN: Duration = Duration::from_millis(1500);
-const AUTO_ACCEPT_TAIL: usize = 4096;
+const AUTO_ACCEPT_TAIL: usize = 8192;
 
 pub struct Shell {
     writer: Box<dyn Write + Send>,
@@ -269,6 +272,7 @@ impl Shell {
         let mut tail: Vec<u8> = Vec::new();
         let mut last_output = Instant::now();
         let mut last_inject = start - AUTO_ACCEPT_COOLDOWN;
+        let mut prompt_seen_at: Option<Instant> = None;
         loop {
             // Inner pty -> screen.
             let mut wrote = false;
@@ -288,17 +292,31 @@ impl Shell {
                 out.flush()?;
             }
 
-            // Auto-accept: when the program has shown a prompt and then gone
-            // quiet (it's waiting for input), inject Enter to take the default.
-            if auto_accept
-                && last_output.elapsed() > AUTO_ACCEPT_IDLE
-                && last_inject.elapsed() > AUTO_ACCEPT_COOLDOWN
-                && looks_like_prompt(&String::from_utf8_lossy(&tail))
-            {
-                self.writer.write_all(b"\r")?;
-                self.writer.flush()?;
-                last_inject = Instant::now();
-                tail.clear(); // require fresh prompt output before injecting again
+            // Auto-accept: inject Enter to take the default once a prompt is up.
+            // Fire when the program goes idle after the prompt, OR — for animated
+            // TUIs that never go idle (isaac/Claude Code redraw a spinner, hints,
+            // cursor) — once the prompt has been on screen long enough to have
+            // finished rendering.
+            if auto_accept {
+                let is_prompt = looks_like_prompt(&String::from_utf8_lossy(&tail));
+                if is_prompt {
+                    prompt_seen_at.get_or_insert_with(Instant::now);
+                } else {
+                    prompt_seen_at = None;
+                }
+                let idle = last_output.elapsed() > AUTO_ACCEPT_IDLE;
+                let settled =
+                    prompt_seen_at.is_some_and(|t| t.elapsed() > AUTO_ACCEPT_SETTLE);
+                if is_prompt
+                    && (idle || settled)
+                    && last_inject.elapsed() > AUTO_ACCEPT_COOLDOWN
+                {
+                    self.writer.write_all(b"\r")?;
+                    self.writer.flush()?;
+                    last_inject = Instant::now();
+                    prompt_seen_at = None;
+                    tail.clear(); // require a fresh prompt before injecting again
+                }
             }
 
             // Keyboard -> inner pty (raw bytes: arrows, escapes, Ctrl-* all pass).
