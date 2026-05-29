@@ -69,8 +69,9 @@ fn interactive_command(input: &str) -> Option<&str> {
         return (!rest.is_empty()).then_some(rest);
     }
     const INTERACTIVE: &[&str] = &[
-        "isaac", "vim", "vi", "nvim", "nano", "emacs", "top", "htop", "less", "more", "man",
-        "ssh", "python", "python3", "ipython", "node", "irb", "psql", "mysql", "tmux", "screen",
+        "isaac", "claude", "vim", "vi", "nvim", "nano", "emacs", "top", "htop", "less", "more",
+        "man", "ssh", "python", "python3", "ipython", "node", "irb", "psql", "mysql", "tmux",
+        "screen",
     ];
     let first = input.split_whitespace().next().unwrap_or("");
     let base = first.rsplit('/').next().unwrap_or(first);
@@ -197,15 +198,15 @@ fn read_line(out: &mut impl Write) -> Result<Option<String>, Box<dyn std::error:
                     }
                 }
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Cancel the current line (like a real shell), don't exit.
-                    // The empty string makes the REPL draw a fresh prompt.
+                    // Ctrl-C at the prompt exits the terminal. (While a command
+                    // is running it's handled separately to interrupt it.)
                     execute!(out, Print("^C"))?;
-                    return Ok(Some(String::new()));
+                    return Ok(None);
                 }
                 KeyCode::Char('d')
                     if k.modifiers.contains(KeyModifiers::CONTROL) && buf.is_empty() =>
                 {
-                    // Ctrl-D on an empty line is EOF -> exit.
+                    // Ctrl-D on an empty line is EOF -> also exit.
                     return Ok(None);
                 }
                 KeyCode::Char(c) => {
@@ -271,6 +272,7 @@ mod tests {
     #[test]
     fn known_interactive_program_routes_to_passthrough() {
         assert_eq!(interactive_command("isaac"), Some("isaac"));
+        assert_eq!(interactive_command("claude"), Some("claude"));
         assert_eq!(interactive_command("vim file.txt"), Some("vim file.txt"));
         assert_eq!(interactive_command("/usr/bin/python3"), Some("/usr/bin/python3"));
     }
