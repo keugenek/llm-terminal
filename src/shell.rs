@@ -15,6 +15,13 @@ const KILL_RETRY: Duration = Duration::from_millis(250);
 // the end marker before declaring the shell unrecoverable.
 const KILL_TOTAL_GRACE: Duration = Duration::from_secs(5);
 
+// Auto-accept tuning: how quiet the program must go after showing a prompt
+// before we inject Enter, the minimum gap between injections, and how many
+// trailing output bytes to scan for prompt patterns.
+const AUTO_ACCEPT_IDLE: Duration = Duration::from_millis(600);
+const AUTO_ACCEPT_COOLDOWN: Duration = Duration::from_millis(1500);
+const AUTO_ACCEPT_TAIL: usize = 4096;
+
 pub struct Shell {
     writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -213,8 +220,22 @@ impl Shell {
     /// for real. Forwards raw bytes both ways until the command's process tree
     /// exits, then resynchronises back to capture mode.
     ///
+    /// When `auto_accept` is set, known agents are launched with their native
+    /// permission-bypass flag, and for any other program the terminal injects
+    /// Enter whenever the program shows a prompt and goes idle.
+    ///
     /// The outer terminal must already be in raw mode.
-    pub fn run_interactive(&mut self, command: &str) -> Result<(), Box<dyn Error>> {
+    pub fn run_interactive(
+        &mut self,
+        command: &str,
+        auto_accept: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let command = if auto_accept {
+            with_auto_accept_flag(command)
+        } else {
+            command.to_string()
+        };
+
         // Match the inner pty to the outer terminal and give bash a capable TERM
         // and sane line discipline so the program renders and reads correctly
         // (capture mode keeps TERM=dumb and echo off).
@@ -243,15 +264,41 @@ impl Shell {
         let mut child_seen = false;
         let start = Instant::now();
         let mut last_child_check = start - Duration::from_secs(1);
+        // Auto-accept injection state: a rolling tail of recent output, when the
+        // program last emitted anything, and when we last injected Enter.
+        let mut tail: Vec<u8> = Vec::new();
+        let mut last_output = Instant::now();
+        let mut last_inject = start - AUTO_ACCEPT_COOLDOWN;
         loop {
             // Inner pty -> screen.
             let mut wrote = false;
             while let Ok(chunk) = self.rx.try_recv() {
                 out.write_all(&chunk)?;
+                if auto_accept {
+                    tail.extend_from_slice(&chunk);
+                    let overflow = tail.len().saturating_sub(AUTO_ACCEPT_TAIL);
+                    if overflow > 0 {
+                        tail.drain(..overflow);
+                    }
+                    last_output = Instant::now();
+                }
                 wrote = true;
             }
             if wrote {
                 out.flush()?;
+            }
+
+            // Auto-accept: when the program has shown a prompt and then gone
+            // quiet (it's waiting for input), inject Enter to take the default.
+            if auto_accept
+                && last_output.elapsed() > AUTO_ACCEPT_IDLE
+                && last_inject.elapsed() > AUTO_ACCEPT_COOLDOWN
+                && looks_like_prompt(&String::from_utf8_lossy(&tail))
+            {
+                self.writer.write_all(b"\r")?;
+                self.writer.flush()?;
+                last_inject = Instant::now();
+                tail.clear(); // require fresh prompt output before injecting again
             }
 
             // Keyboard -> inner pty (raw bytes: arrows, escapes, Ctrl-* all pass).
@@ -314,6 +361,44 @@ impl Shell {
         }
         Ok(())
     }
+}
+
+/// Map of programs to their native permission-bypass flag. Using the program's
+/// own flag is more reliable than injecting keystrokes, so prefer it when known.
+fn with_auto_accept_flag(command: &str) -> String {
+    let first = command.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    let flag = match base {
+        "claude" => Some("--dangerously-skip-permissions"),
+        _ => None,
+    };
+    match flag {
+        Some(f) if !command.contains(f) => format!("{command} {f}"),
+        _ => command.to_string(),
+    }
+}
+
+/// Heuristic: does the trailing output look like a yes/no or selection prompt
+/// that's waiting for the user? Used to decide when to inject an accept.
+fn looks_like_prompt(tail: &str) -> bool {
+    let t = tail.to_lowercase();
+    const NEEDLES: &[&str] = &[
+        "(y/n)",
+        "[y/n]",
+        "y/n)",
+        "yes/no",
+        "do you want",
+        "proceed?",
+        "continue?",
+        "press enter",
+        "1. yes",
+        "1) yes",
+        "❯ 1",
+        "(use arrow keys)",
+        "approve",
+        "allow this",
+    ];
+    NEEDLES.iter().any(|n| t.contains(n))
 }
 
 /// True if `pid` currently has at least one direct child process.
@@ -427,6 +512,39 @@ mod tests {
 
     fn never() -> impl FnMut() -> bool {
         || false
+    }
+
+    #[test]
+    fn auto_accept_flag_added_for_claude() {
+        assert_eq!(
+            with_auto_accept_flag("claude"),
+            "claude --dangerously-skip-permissions"
+        );
+        assert_eq!(
+            with_auto_accept_flag("/usr/local/bin/claude --resume"),
+            "/usr/local/bin/claude --resume --dangerously-skip-permissions"
+        );
+        // Idempotent: don't add the flag twice.
+        assert_eq!(
+            with_auto_accept_flag("claude --dangerously-skip-permissions"),
+            "claude --dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
+    fn auto_accept_flag_untouched_for_unknown_program() {
+        assert_eq!(with_auto_accept_flag("isaac"), "isaac");
+        assert_eq!(with_auto_accept_flag("vim a.txt"), "vim a.txt");
+    }
+
+    #[test]
+    fn prompt_detection() {
+        assert!(looks_like_prompt("Do you want to proceed?"));
+        assert!(looks_like_prompt("❯ 1. Yes\n  2. No"));
+        assert!(looks_like_prompt("Overwrite? (y/n)"));
+        assert!(looks_like_prompt("Press enter to continue"));
+        assert!(!looks_like_prompt("just some regular output\nwith no question"));
+        assert!(!looks_like_prompt(""));
     }
 
     #[test]

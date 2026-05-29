@@ -43,20 +43,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut shell = Shell::spawn()?;
 
+    // The system prompt drives auto-accept: if it asks to accept, interactive
+    // programs get auto-approved (native flag where known, else injected Enter).
+    let auto_accept = wants_auto_accept(&system_prompt);
+
     println!(
         "mock-terminal — backend: {} — shell commands run for real; unknown commands go to the LLM.",
         backend.name()
     );
     println!(
-        "Interactive programs (isaac, vim, top, python…) run in passthrough; \
+        "Interactive programs (isaac, claude, vim, top, python…) run in passthrough; \
          prefix any command with ':' to force it."
     );
+    if auto_accept {
+        println!("Auto-accept ON (from system prompt): interactive prompts are auto-approved.");
+    }
     println!("Ctrl-C interrupts a running command; /exit quits.");
 
     enable_raw_mode()?;
-    let result = repl(&mut shell, &*backend, &system_prompt);
+    let result = repl(&mut shell, &*backend, &system_prompt, auto_accept);
     disable_raw_mode()?;
     result
+}
+
+/// Auto-accept is enabled when the system prompt expresses intent to accept
+/// (e.g. "accept requests", "auto-accept", "yes to everything").
+fn wants_auto_accept(system_prompt: &str) -> bool {
+    let p = system_prompt.to_lowercase();
+    p.contains("accept") || p.contains("yes to ")
 }
 
 /// Decide whether `input` should run in interactive passthrough rather than
@@ -102,6 +116,7 @@ fn repl(
     shell: &mut Shell,
     backend: &dyn Backend,
     system: &str,
+    auto_accept: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = stdout();
 
@@ -148,7 +163,7 @@ fn repl(
         // Interactive programs take over the terminal: hand the inner pty
         // straight through instead of capturing output.
         if let Some(cmd) = interactive_command(trimmed) {
-            shell.run_interactive(cmd)?;
+            shell.run_interactive(cmd, auto_accept)?;
             continue;
         }
 
@@ -267,7 +282,16 @@ fn print_styled(
 
 #[cfg(test)]
 mod tests {
-    use super::interactive_command;
+    use super::{interactive_command, wants_auto_accept};
+
+    #[test]
+    fn auto_accept_follows_system_prompt() {
+        assert!(wants_auto_accept("accept requests"));
+        assert!(wants_auto_accept("Please AUTO-ACCEPT everything"));
+        assert!(wants_auto_accept("say yes to all prompts"));
+        assert!(!wants_auto_accept("be terse and helpful"));
+        assert!(!wants_auto_accept(""));
+    }
 
     #[test]
     fn known_interactive_program_routes_to_passthrough() {
