@@ -254,10 +254,18 @@ impl Shell {
         trajectory: &Trajectory,
         pending_input: Option<&str>,
     ) -> Result<(), Box<dyn Error>> {
-        let command = if auto_accept {
-            with_auto_accept_flag(command)
+        // When auto-accept is on, prefer a known agent's native permission-bypass
+        // flag (claude/codex). If one is applied, the agent handles its own
+        // permissions and shows no prompts to grade — so the output-scanning
+        // broker must stay OFF, or it false-positives on the agent's normal TUI
+        // chrome (e.g. `❯ 1`, mode/effort selectors) and spams escalations. The
+        // broker only runs as a fallback for auto-accept programs that did NOT
+        // get a native flag.
+        let (command, mut broker_active) = if auto_accept {
+            let native_bypass = applies_native_bypass(command);
+            (with_auto_accept_flag(command), !native_bypass)
         } else {
-            command.to_string()
+            (command.to_string(), false)
         };
 
         // Match the inner pty to the outer terminal and give bash a capable TERM
@@ -302,7 +310,7 @@ impl Shell {
         // it once the program settles, then clear so we never type it twice.
         let mut pending_input = pending_input;
         // Track output for idle detection whenever either path needs it.
-        let track_output = auto_accept || pending_input.is_some();
+        let track_output = broker_active || pending_input.is_some();
         loop {
             // Inner pty -> screen.
             let mut wrote = false;
@@ -311,7 +319,7 @@ impl Shell {
                 if track_output {
                     last_output = Instant::now();
                 }
-                if auto_accept {
+                if broker_active {
                     tail.extend_from_slice(&chunk);
                     let overflow = tail.len().saturating_sub(AUTO_ACCEPT_TAIL);
                     if overflow > 0 {
@@ -344,7 +352,7 @@ impl Shell {
             // goes idle after the prompt, OR — for animated TUIs that never go
             // idle (Claude Code redraws a spinner, hints, cursor) — once the
             // prompt has been on screen long enough to have finished rendering.
-            if auto_accept {
+            if broker_active {
                 let is_prompt = looks_like_prompt(&String::from_utf8_lossy(&tail));
                 if is_prompt {
                     prompt_seen_at.get_or_insert_with(Instant::now);
@@ -402,8 +410,6 @@ impl Shell {
                         }
                         Action::Escalate => {
                             // Hand control to the human: don't inject anything.
-                            // Surface the reason on its own line; the cooldown
-                            // keeps this from spamming while the human reacts.
                             let reason = decider.last_reason();
                             let reason = if reason.is_empty() {
                                 "prompt not clearly allowed by policy".to_string()
@@ -411,6 +417,17 @@ impl Shell {
                                 reason
                             };
                             print_escalation(&mut out, &reason)?;
+                            // If the broker is unreachable (e.g. a bad API key),
+                            // it will fail the same way on every prompt — so print
+                            // once and disable it for the rest of the session
+                            // rather than spamming the program's screen.
+                            if reason.contains("unreachable") {
+                                print_escalation(
+                                    &mut out,
+                                    "broker unreachable — disabling auto-accept for this session",
+                                )?;
+                                broker_active = false;
+                            }
                             // Keep the tail so we don't immediately re-detect and
                             // re-escalate the same prompt within the cooldown.
                         }
@@ -480,19 +497,32 @@ impl Shell {
     }
 }
 
-/// Map of programs to their native permission-bypass flag. Using the program's
-/// own flag is more reliable than injecting keystrokes, so prefer it when known.
-fn with_auto_accept_flag(command: &str) -> String {
+/// The native permission-bypass flag for a known agent, keyed on the command's
+/// first-token basename. `None` for programs we don't recognise.
+fn native_bypass_flag(command: &str) -> Option<&'static str> {
     let first = command.split_whitespace().next().unwrap_or("");
     let base = first.rsplit('/').next().unwrap_or(first);
-    let flag = match base {
+    match base {
         "claude" => Some("--dangerously-skip-permissions"),
         _ => None,
-    };
-    match flag {
+    }
+}
+
+/// Append a known agent's native permission-bypass flag (if not already present).
+/// Using the program's own flag is far more reliable than injecting keystrokes.
+fn with_auto_accept_flag(command: &str) -> String {
+    match native_bypass_flag(command) {
         Some(f) if !command.contains(f) => format!("{command} {f}"),
         _ => command.to_string(),
     }
+}
+
+/// True if `command` is a known agent that bypasses its own permissions. When it
+/// does, the agent self-approves and shows no real prompts, so the output-
+/// scanning broker must be disabled to avoid false-positives on its TUI chrome —
+/// regardless of whether the bypass flag was already present in the command.
+fn applies_native_bypass(command: &str) -> bool {
+    native_bypass_flag(command).is_some()
 }
 
 /// What `run_interactive` does for a graded decision. Split out as a pure
@@ -658,6 +688,22 @@ fn find_end(text: &str, prefix: &str, suffix: &str) -> Option<(usize, i32)> {
 mod tests {
     use super::*;
     use crate::decider::MockDecider;
+
+    // A known agent gets a native bypass flag, so the output-scanning broker is
+    // disabled for it (it would otherwise false-positive on the agent's TUI).
+    // An unknown / non-agent program gets no flag, so the broker stays available.
+    #[test]
+    fn native_bypass_disables_broker_for_known_agents() {
+        assert!(applies_native_bypass("claude"));
+        assert!(applies_native_bypass("claude 'fix the bug'"));
+        assert!(applies_native_bypass("/usr/local/bin/claude --resume"));
+        assert!(!applies_native_bypass("vim a.txt"));
+        assert!(!applies_native_bypass("aider"));
+        // Already-present flag is still recognised as a known agent (broker off).
+        assert!(applies_native_bypass(
+            "claude --dangerously-skip-permissions"
+        ));
+    }
 
     // The action taken at a settled prompt is a pure mapping from the broker's
     // decision; verify it without a live PTY.
