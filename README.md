@@ -56,6 +56,52 @@ Ctrl-C              # interrupt a running command (or exit at the prompt)
 /exit               # quit
 ```
 
+## Sessions — launch a pre-configured agent run from a file or URL
+
+Instead of typing the system prompt and launching the agent by hand, hand
+llm-terminal a **manifest** — one self-contained JSON file (or a URL to one)
+that is the whole handoff:
+
+```json
+// examples/session.json
+{
+  "name": "fix flaky test",
+  "system_prompt": "auto-approve reads and tests; DENY anything containing rm -rf; escalate network or spend",
+  "instructions": "Find and fix the flaky test, then run the suite until green.",
+  "backend": "anthropic",
+  "cwd": "/path/to/repo",
+  "setup": ["echo preparing"],
+  "run": "claude"
+}
+```
+
+Open it:
+
+```bash
+mock-terminal open examples/session.json     # or:  open https://…/session.json
+```
+
+It shows a **session card** and waits for confirmation before running anything —
+the safety gate, and exactly why a manifest fetched from a URL is never executed
+unreviewed. On confirm: the `system_prompt` becomes the session policy (so
+auto-accept + the Haiku broker engage as in interactive mode), it `cd`s into
+`cwd`, runs `setup`, then launches `run` with `instructions` delivered to the
+agent — via its native prompt flag where known (`claude "<task>"`,
+`codex exec "<task>"`) or typed in once an unknown agent's input settles —
+before dropping into the interactive prompt.
+
+To open one in a **dedicated macOS Terminal window (or tab)** from another
+session — e.g. to fan out several agents in parallel — use the launcher:
+
+```bash
+scripts/spawn.sh examples/session.json --name fix-flaky-test
+scripts/spawn.sh https://…/session.json --tab        # as a tab instead
+```
+
+It opens a titled window running `mock-terminal open <file-or-url>` (which shows
+its own card + confirm in that window); each session logs its trajectory under
+`~/.til/trajectories/` (JSONL). macOS only (uses `osascript`).
+
 ## How it works
 
 A persistent `bash` runs inside a PTY. Each captured command is wrapped with
@@ -77,8 +123,9 @@ clearly allow is escalated back to you instead of approved.
 ## Tests
 
 ```bash
-cargo test          # 33 unit + PTY integration tests
-expect tests/smoke.exp   # end-to-end: shell, interrupt, passthrough, auto-accept
+cargo test          # 59 unit + PTY integration tests
+expect tests/smoke.exp     # end-to-end: shell, interrupt, passthrough, auto-accept
+expect tests/manifest.exp  # end-to-end: `open` renders card, confirms, runs
 ```
 
 ## Built with Claude Code

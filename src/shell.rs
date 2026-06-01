@@ -29,6 +29,10 @@ const AUTO_ACCEPT_TAIL: usize = 8192;
 // After a Deny sends its primary reject ("2"), wait this long before falling
 // back to Escape if the program is still prompting.
 const AUTO_ACCEPT_DENY_FOLLOWUP: Duration = Duration::from_millis(500);
+// For unattended task delivery: once an interactively-prompting agent has drawn
+// output and then gone quiet this long, it's ready for the task to be typed in.
+// Longer than IDLE so the agent's startup banner/TUI has fully settled first.
+const AUTO_ACCEPT_TASK_DELAY: Duration = Duration::from_millis(1500);
 
 pub struct Shell {
     writer: Box<dyn Write + Send>,
@@ -235,6 +239,11 @@ impl Shell {
     /// control back to the human). When `auto_accept` is off we never inject —
     /// the `decider` and `policy` are ignored, same as before this feature.
     ///
+    /// `pending_input`, when set, is the task text typed into the program once,
+    /// followed by Enter, after the program's first output burst settles. This
+    /// is how unattended task delivery seeds an agent that takes its prompt
+    /// interactively rather than from argv. It fires regardless of `auto_accept`.
+    ///
     /// The outer terminal must already be in raw mode.
     pub fn run_interactive(
         &mut self,
@@ -243,6 +252,7 @@ impl Shell {
         decider: &dyn Decider,
         policy: &str,
         trajectory: &Trajectory,
+        pending_input: Option<&str>,
     ) -> Result<(), Box<dyn Error>> {
         let command = if auto_accept {
             with_auto_accept_flag(command)
@@ -288,23 +298,45 @@ impl Shell {
         // program is still prompting a moment later — we can follow up with an
         // Escape as a fallback. Reset once the prompt clears or we follow up.
         let mut deny_sent_at: Option<Instant> = None;
+        // Task delivery for an agent that takes its prompt interactively: type
+        // it once the program settles, then clear so we never type it twice.
+        let mut pending_input = pending_input;
+        // Track output for idle detection whenever either path needs it.
+        let track_output = auto_accept || pending_input.is_some();
         loop {
             // Inner pty -> screen.
             let mut wrote = false;
             while let Ok(chunk) = self.rx.try_recv() {
                 out.write_all(&chunk)?;
+                if track_output {
+                    last_output = Instant::now();
+                }
                 if auto_accept {
                     tail.extend_from_slice(&chunk);
                     let overflow = tail.len().saturating_sub(AUTO_ACCEPT_TAIL);
                     if overflow > 0 {
                         tail.drain(..overflow);
                     }
-                    last_output = Instant::now();
                 }
                 wrote = true;
             }
             if wrote {
                 out.flush()?;
+            }
+
+            // Unattended task delivery: once the program has produced output and
+            // then gone idle long enough to be waiting for input, type the task
+            // followed by Enter exactly once. Gated on having seen output so we
+            // don't fire into a program that hasn't drawn its input line yet.
+            if let Some(task) = pending_input {
+                let drew_something = last_output > start;
+                if drew_something && last_output.elapsed() > AUTO_ACCEPT_TASK_DELAY {
+                    self.writer.write_all(task.as_bytes())?;
+                    self.writer.write_all(b"\r")?;
+                    self.writer.flush()?;
+                    trajectory.log_interactive(&format!("task-injected: {task}"));
+                    pending_input = None;
+                }
             }
 
             // Auto-accept: once a prompt is up and has settled, ask the broker

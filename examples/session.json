@@ -1,0 +1,8 @@
+{
+  "name": "fix flaky test",
+  "system_prompt": "auto-approve reads and tests; DENY anything containing rm -rf; escalate network or spend",
+  "instructions": "Find and fix the flaky test, then run the suite until green.",
+  "backend": "anthropic",
+  "setup": ["echo preparing workspace"],
+  "run": "claude"
+}

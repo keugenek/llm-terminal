@@ -1,10 +1,12 @@
 mod backend;
 mod decider;
+mod manifest;
 mod shell;
 mod trajectory;
 
 use backend::{AnthropicBackend, Backend, MockBackend};
 use decider::{AlwaysApprove, Decider, HaikuDecider};
+use manifest::Manifest;
 use trajectory::Trajectory;
 use crossterm::{
     cursor,
@@ -28,8 +30,188 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let backend_kind = std::env::args().nth(1).unwrap_or_else(|| "mock".to_string());
+    // `open <file-or-url>` launches a pre-configured session from a JSON manifest
+    // (read from a local path or fetched over HTTP(S)): show a session card,
+    // confirm, then boot wired up as the manifest says. Checked first so `open`
+    // is unambiguous as a subcommand. Everything else is the interactive REPL.
+    if std::env::args().nth(1).as_deref() == Some("open") {
+        let source = std::env::args()
+            .nth(2)
+            .ok_or("usage: open <manifest.json | https://…>")?;
+        return run_manifest(&source);
+    }
+    run_interactive_session(std::env::args().nth(1).unwrap_or_else(|| "mock".to_string()))
+}
 
+/// Load a manifest from a local path or, when `source` looks like an HTTP(S)
+/// URL, by fetching it with the ureq client already in the tree. Either way the
+/// caller still shows the card and requires confirmation before running.
+fn load_manifest(source: &str) -> Result<Manifest, Box<dyn std::error::Error>> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let body = ureq::get(source).call()?.into_string()?;
+        Manifest::from_json(&body).map_err(|e| format!("manifest {source}: {e}").into())
+    } else {
+        Manifest::from_file(std::path::Path::new(source))
+    }
+}
+
+/// `open <file-or-url>`: parse the manifest, show the session card, require
+/// explicit confirmation, then boot a session configured FROM the manifest —
+/// system prompt, backend, broker, cwd, setup commands, and the `run` launch
+/// (with `instructions` delivered to the agent) — before dropping into the REPL.
+///
+/// The card + confirm gate is the safety primitive: nothing runs until the user
+/// has seen exactly what will run and approved it — especially important when
+/// the manifest was fetched from a URL.
+fn run_manifest(source: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let m = load_manifest(source)?;
+
+    // Auto-accept is derived from the system prompt, exactly as the interactive
+    // session does it — never a separate manifest field.
+    let auto_accept = wants_auto_accept(&m.system_prompt);
+
+    // Show the card and gate on confirmation BEFORE building or running
+    // anything. Read a single line from stdin (cooked mode — raw mode isn't
+    // enabled yet) and proceed only on an affirmative/empty answer.
+    print!("{}", manifest::render_card(&m, auto_accept));
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !manifest::is_confirmed(&answer) {
+        println!("→ Aborted; nothing was run.");
+        return Ok(());
+    }
+
+    let backend = build_backend(&m.backend);
+    let decider = build_decider(auto_accept);
+
+    let mut shell = Shell::spawn()?;
+    let trajectory = Trajectory::new();
+    trajectory.log_manifest(&m.name);
+
+    println!(
+        "mock-terminal — backend: {} — launching session from manifest.",
+        backend.name()
+    );
+    if auto_accept {
+        println!(
+            "Auto-accept ON (from system prompt): prompts graded by the {} policy broker.",
+            decider_name(&*decider)
+        );
+    }
+
+    // cwd first (a real captured command, so the cd persists into setup + run).
+    if let Some(cwd) = &m.cwd {
+        let mut never = || false;
+        let _ = shell.run(&format!("cd {}", shell_quote(cwd)), &mut never);
+    }
+
+    // Setup runs in capture mode (output shown) so the user sees preparation
+    // results before the main launch. A failing setup command is surfaced but
+    // does not abort — the user already approved the whole plan.
+    for cmd in &m.setup {
+        println!("setup $ {cmd}");
+        let mut never = || false;
+        match shell.run(cmd, &mut never) {
+            Ok(result) => {
+                trajectory.log_command(cmd, result.exit_code, result.interrupted);
+                if !result.output.is_empty() {
+                    println!("{}", result.output);
+                }
+            }
+            Err(e) => eprintln!("setup error: {e}"),
+        }
+    }
+
+    enable_raw_mode()?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(run) = &m.run {
+            // Deliver `instructions` to the agent: via its native prompt flag
+            // where known (claude/codex), else by keystroke injection once the
+            // agent's input settles. With no instructions, launch bare.
+            let (launch_cmd, inject) = if m.instructions.is_empty() {
+                (run.clone(), false)
+            } else {
+                manifest::agent_launch(run, &m.instructions)
+            };
+            let pending = inject.then_some(m.instructions.as_str());
+
+            if let Some(cmd) = interactive_command(&launch_cmd) {
+                trajectory.log_interactive(cmd);
+                shell.run_interactive(
+                    cmd,
+                    auto_accept,
+                    &*decider,
+                    &m.system_prompt,
+                    &trajectory,
+                    pending,
+                )?;
+            } else {
+                let mut never = || false;
+                let res = shell.run(&launch_cmd, &mut never)?;
+                trajectory.log_command(&launch_cmd, res.exit_code, res.interrupted);
+                if !res.output.is_empty() {
+                    let mut out = stdout();
+                    print_block(&mut out, &res.output)?;
+                }
+            }
+        }
+        // Continue interactively after the manifest launch.
+        repl(
+            &mut shell,
+            &*backend,
+            &m.system_prompt,
+            auto_accept,
+            &*decider,
+            &trajectory,
+        )
+    })();
+    disable_raw_mode()?;
+    result
+}
+
+/// Single-quote a path for safe use as one shell word (cwd may contain spaces).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the LLM-fallback backend for the session. "anthropic"/"claude" use the
+/// real API client, falling back to mock (with a notice) when it can't init;
+/// anything else is the mock backend. Shared by every entry point so the backend
+/// selection stays identical across interactive, task, and manifest modes.
+fn build_backend(kind: &str) -> Box<dyn Backend> {
+    match kind {
+        "anthropic" | "claude" => match AnthropicBackend::from_env() {
+            Ok(b) => Box::new(b),
+            Err(e) => {
+                eprintln!("anthropic init failed: {e}; falling back to mock");
+                Box::new(MockBackend::new())
+            }
+        },
+        _ => Box::new(MockBackend::new()),
+    }
+}
+
+/// Build the auto-accept policy broker. When auto-accept is on we prefer the
+/// model-graded Haiku decider, falling back to blind AlwaysApprove if there's no
+/// API key (preserving the old behaviour rather than failing to auto-accept).
+/// When auto-accept is off the decider is never consulted, so a cheap
+/// AlwaysApprove placeholder is fine. Shared across all entry points.
+fn build_decider(auto_accept: bool) -> Box<dyn Decider> {
+    if auto_accept {
+        match HaikuDecider::from_env() {
+            Ok(d) => Box::new(d),
+            Err(_) => {
+                println!("auto-accept: no API key, approving by default");
+                Box::new(AlwaysApprove)
+            }
+        }
+    } else {
+        Box::new(AlwaysApprove)
+    }
+}
+
+fn run_interactive_session(backend_kind: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("════════════════════════════════════════════════════════════════");
     println!(" Set a SYSTEM PROMPT for this session (optional).");
     println!(" It does two things:");
@@ -47,40 +229,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("→ System prompt set ({} chars).", system_prompt.len());
     }
 
-    let backend: Box<dyn Backend> = match backend_kind.as_str() {
-        "anthropic" | "claude" => match AnthropicBackend::from_env() {
-            Ok(b) => Box::new(b),
-            Err(e) => {
-                eprintln!("anthropic init failed: {e}; falling back to mock");
-                Box::new(MockBackend::new())
-            }
-        },
-        _ => Box::new(MockBackend::new()),
-    };
+    let backend = build_backend(&backend_kind);
 
     let mut shell = Shell::spawn()?;
 
     // The system prompt drives auto-accept: if it asks to accept, interactive
     // programs get auto-approved (native flag where known, else a graded
-    // decision on each prompt).
+    // decision on each prompt). When on, build the policy broker (model-graded
+    // Haiku, or blind AlwaysApprove without an API key).
     let auto_accept = wants_auto_accept(&system_prompt);
-
-    // When auto-accept is on, build the policy broker. Prefer the model-graded
-    // Haiku decider (it weighs each prompt against the system prompt as policy);
-    // fall back to AlwaysApprove if there's no API key, preserving the old
-    // blind-accept behaviour rather than failing to auto-accept at all.
-    let decider: Box<dyn Decider> = if auto_accept {
-        match HaikuDecider::from_env() {
-            Ok(d) => Box::new(d),
-            Err(_) => {
-                println!("auto-accept: no API key, approving by default");
-                Box::new(AlwaysApprove)
-            }
-        }
-    } else {
-        // Never consulted when auto-accept is off; a cheap placeholder.
-        Box::new(AlwaysApprove)
-    };
+    let decider = build_decider(auto_accept);
 
     println!(
         "mock-terminal — backend: {} — shell commands run for real; unknown commands go to the LLM.",
@@ -231,7 +389,7 @@ fn repl(
         // the policy the broker grades each settled prompt against.
         if let Some(cmd) = interactive_command(trimmed) {
             trajectory.log_interactive(cmd);
-            shell.run_interactive(cmd, auto_accept, decider, system, trajectory)?;
+            shell.run_interactive(cmd, auto_accept, decider, system, trajectory, None)?;
             continue;
         }
 

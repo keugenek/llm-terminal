@@ -98,6 +98,17 @@ impl Trajectory {
         }));
     }
 
+    /// A session was launched from a manifest (`til open`). Records the
+    /// manifest's name (redacted) so the trajectory shows which pre-configured
+    /// session ran.
+    pub fn log_manifest(&self, name: &str) {
+        self.write(json!({
+            "ts": unix_millis(),
+            "kind": "manifest",
+            "name": redact(name),
+        }));
+    }
+
     /// The auto-accept broker reached a verdict on a settled prompt. `verdict`
     /// is "approve" | "deny" | "escalate"; `prompt_excerpt` is the scraped TUI
     /// tail (truncated and redacted before writing).

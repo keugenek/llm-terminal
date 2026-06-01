@@ -1,0 +1,45 @@
+#!/usr/bin/env expect
+# End-to-end for `open <manifest>`: the session card renders, confirmation gates
+# execution, setup + run happen on "y", and the session drops into the REPL.
+# A separate run verifies "n" aborts without running anything.
+set timeout 15
+log_user 0
+set env(MT_TRAJECTORY_DIR) /tmp/til-manifest-test
+
+# Write a small manifest with a setup command and a non-interactive run.
+set f /tmp/mt-session.json
+set fh [open $f w]
+puts $fh "{ \"name\": \"demo\", \"system_prompt\": \"accept reads and tests\", \"setup\": \[\"echo setup-ran\"\], \"run\": \"echo run-ran\" }"
+close $fh
+
+# --- confirm path ---
+spawn ./target/debug/mock-terminal open $f
+expect {
+    "SESSION TO LAUNCH" { puts "PASS: session card rendered" }
+    timeout { puts "FAIL: no card"; exit 1 }
+}
+expect "Launch this session?"
+send "y\r"
+expect {
+    "setup-ran" { puts "PASS: setup command ran after confirm" }
+    timeout { puts "FAIL: setup did not run"; exit 1 }
+}
+expect {
+    "run-ran" { puts "PASS: run command executed" }
+    timeout { puts "FAIL: run did not execute"; exit 1 }
+}
+expect "$ "
+send "/exit\r"
+expect eof
+
+# --- abort path ---
+spawn ./target/debug/mock-terminal open $f
+expect "Launch this session?"
+send "n\r"
+expect {
+    "Aborted; nothing was run" { puts "PASS: 'n' aborts without running" }
+    "setup-ran" { puts "FAIL: ran despite abort"; exit 1 }
+    timeout { puts "FAIL: no abort message"; exit 1 }
+}
+expect eof
+puts "PASS: clean"
