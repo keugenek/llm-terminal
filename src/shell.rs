@@ -1,4 +1,5 @@
 use crate::decider::{Decider, Decision};
+use crate::trajectory::Trajectory;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::error::Error;
 use std::io::{Read, Write};
@@ -241,6 +242,7 @@ impl Shell {
         auto_accept: bool,
         decider: &dyn Decider,
         policy: &str,
+        trajectory: &Trajectory,
     ) -> Result<(), Box<dyn Error>> {
         let command = if auto_accept {
             with_auto_accept_flag(command)
@@ -341,6 +343,14 @@ impl Shell {
                 {
                     let tail_text = String::from_utf8_lossy(&tail).into_owned();
                     let decision = decider.decide(&tail_text, policy);
+                    // Record the verdict before acting: the scraped tail is the
+                    // prompt excerpt, and the decider's reason explains the call.
+                    // The logger redacts/truncates; here we just forward.
+                    trajectory.log_decision(
+                        decision_verdict(decision),
+                        &decider.last_reason(),
+                        &tail_text,
+                    );
                     // The cooldown applies to every settled decision (approve,
                     // deny, escalate) so we never re-fire on the same prompt.
                     last_inject = Instant::now();
@@ -478,6 +488,16 @@ fn decision_action(decision: Decision) -> Action {
         Decision::Approve => Action::Inject(b"\r"),
         Decision::Deny => Action::Deny(b"2\r"),
         Decision::Escalate => Action::Escalate,
+    }
+}
+
+/// The lowercase verdict label recorded in the trajectory log for a decision.
+/// Kept as a pure mapping next to `decision_action` so the two stay in sync.
+fn decision_verdict(decision: Decision) -> &'static str {
+    match decision {
+        Decision::Approve => "approve",
+        Decision::Deny => "deny",
+        Decision::Escalate => "escalate",
     }
 }
 
@@ -624,6 +644,15 @@ mod tests {
     #[test]
     fn escalate_injects_nothing() {
         assert_eq!(decision_action(Decision::Escalate), Action::Escalate);
+    }
+
+    // The verdict label logged for each decision must match the trajectory
+    // schema's "approve" | "deny" | "escalate".
+    #[test]
+    fn decision_verdict_labels() {
+        assert_eq!(decision_verdict(Decision::Approve), "approve");
+        assert_eq!(decision_verdict(Decision::Deny), "deny");
+        assert_eq!(decision_verdict(Decision::Escalate), "escalate");
     }
 
     // End-to-end at the decision level: a MockDecider's verdict maps to the

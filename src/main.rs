@@ -1,9 +1,11 @@
 mod backend;
 mod decider;
 mod shell;
+mod trajectory;
 
 use backend::{AnthropicBackend, Backend, MockBackend};
 use decider::{AlwaysApprove, Decider, HaikuDecider};
+use trajectory::Trajectory;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -96,8 +98,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Ctrl-C interrupts a running command; /exit quits.");
 
+    // One trajectory log per session, threaded into the REPL and (via it) the
+    // interactive loop. It degrades to a no-op if it can't open its file, so it
+    // never blocks starting the terminal.
+    let trajectory = Trajectory::new();
+
     enable_raw_mode()?;
-    let result = repl(&mut shell, &*backend, &system_prompt, auto_accept, &*decider);
+    let result = repl(
+        &mut shell,
+        &*backend,
+        &system_prompt,
+        auto_accept,
+        &*decider,
+        &trajectory,
+    );
     disable_raw_mode()?;
     result
 }
@@ -168,6 +182,7 @@ fn repl(
     system: &str,
     auto_accept: bool,
     decider: &dyn Decider,
+    trajectory: &Trajectory,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = stdout();
 
@@ -215,18 +230,21 @@ fn repl(
         // straight through instead of capturing output. The system prompt is
         // the policy the broker grades each settled prompt against.
         if let Some(cmd) = interactive_command(trimmed) {
-            shell.run_interactive(cmd, auto_accept, decider, system)?;
+            trajectory.log_interactive(cmd);
+            shell.run_interactive(cmd, auto_accept, decider, system, trajectory)?;
             continue;
         }
 
         match shell.run(trimmed, &mut poll_ctrl_c) {
             Ok(result) => {
+                trajectory.log_command(trimmed, result.exit_code, result.interrupted);
                 if !result.output.is_empty() {
                     print_block(&mut out, &result.output)?;
                 }
                 if result.interrupted {
                     print_styled(&mut out, Color::Yellow, "· interrupted")?;
                 } else if result.exit_code == NOT_FOUND_EXIT_CODE {
+                    trajectory.log_llm_fallback(trimmed);
                     print_styled(
                         &mut out,
                         Color::Yellow,

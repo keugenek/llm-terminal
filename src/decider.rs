@@ -50,8 +50,11 @@ impl Decider for AlwaysApprove {
 /// (prompt, policy) pair, so a test can encode any rule it likes (e.g. "deny if
 /// the prompt contains `rm -rf`"). Test-only: it's never built by the binary.
 #[cfg(test)]
+type DecisionRule = Box<dyn Fn(&str, &str) -> Decision>;
+
+#[cfg(test)]
 pub struct MockDecider {
-    rule: Box<dyn Fn(&str, &str) -> Decision>,
+    rule: DecisionRule,
 }
 
 #[cfg(test)]
