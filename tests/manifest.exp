@@ -1,7 +1,7 @@
 #!/usr/bin/env expect
-# End-to-end for `open <manifest>`: the session card renders, confirmation gates
-# execution, setup + run happen on "y", and the session drops into the REPL.
-# A separate run verifies "n" aborts without running anything.
+# End-to-end for `open <manifest>`:
+#   - a LOCAL manifest auto-confirms (no prompt) and runs setup + run
+#   - `--confirm` forces the gate: "y" runs, "n" aborts
 set timeout 15
 log_user 0
 set env(MT_TRAJECTORY_DIR) /tmp/til-manifest-test
@@ -12,32 +12,47 @@ set fh [open $f w]
 puts $fh "{ \"name\": \"demo\", \"system_prompt\": \"accept reads and tests\", \"setup\": \[\"echo setup-ran\"\], \"run\": \"echo run-ran\" }"
 close $fh
 
-# --- confirm path ---
+# --- local auto-confirm path (no prompt, no keystroke) ---
 spawn ./target/debug/mock-terminal open $f
 expect {
     "SESSION TO LAUNCH" { puts "PASS: session card rendered" }
     timeout { puts "FAIL: no card"; exit 1 }
 }
-expect "Launch this session?"
-send "y\r"
 expect {
-    "setup-ran" { puts "PASS: setup command ran after confirm" }
+    "auto-confirmed" { puts "PASS: local manifest auto-confirmed (no prompt)" }
+    "Launch this session?" { puts "FAIL: local manifest still prompted"; exit 1 }
+    timeout { puts "FAIL: no auto-confirm"; exit 1 }
+}
+expect {
+    "setup-ran" { puts "PASS: setup ran" }
     timeout { puts "FAIL: setup did not run"; exit 1 }
 }
 expect {
-    "run-ran" { puts "PASS: run command executed" }
+    "run-ran" { puts "PASS: run executed" }
     timeout { puts "FAIL: run did not execute"; exit 1 }
 }
 expect "$ "
 send "/exit\r"
 expect eof
 
-# --- abort path ---
-spawn ./target/debug/mock-terminal open $f
+# --- --confirm gate, accept ---
+spawn ./target/debug/mock-terminal open $f --confirm
+expect "Launch this session?"
+send "y\r"
+expect {
+    "setup-ran" { puts "PASS: --confirm + y runs" }
+    timeout { puts "FAIL: --confirm y did not run"; exit 1 }
+}
+expect "$ "
+send "/exit\r"
+expect eof
+
+# --- --confirm gate, abort ---
+spawn ./target/debug/mock-terminal open $f --confirm
 expect "Launch this session?"
 send "n\r"
 expect {
-    "Aborted; nothing was run" { puts "PASS: 'n' aborts without running" }
+    "Aborted; nothing was run" { puts "PASS: --confirm + n aborts" }
     "setup-ran" { puts "FAIL: ran despite abort"; exit 1 }
     timeout { puts "FAIL: no abort message"; exit 1 }
 }

@@ -221,7 +221,8 @@ pub fn render_card(m: &Manifest, auto_accept: bool) -> String {
     }
 
     s.push_str("════════════════════════════════════════════════════════════════\n");
-    s.push_str("Launch this session? [Y/n] ");
+    // The "Launch this session? [Y/n]" prompt is printed by the caller, and only
+    // when confirmation is actually required (URL source or --confirm).
     s
 }
 

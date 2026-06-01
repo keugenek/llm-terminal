@@ -37,8 +37,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("open") {
         let source = std::env::args()
             .nth(2)
-            .ok_or("usage: open <manifest.json | https://…>")?;
-        return run_manifest(&source);
+            .ok_or("usage: open <manifest.json | https://…> [--yes | --confirm]")?;
+        // --yes skips the launch prompt outright; --confirm forces it even for a
+        // local file. Default: confirm only URL-sourced manifests.
+        let force_yes = std::env::args().skip(3).any(|a| a == "--yes" || a == "-y");
+        let force_confirm = std::env::args().skip(3).any(|a| a == "--confirm");
+        return run_manifest(&source, force_yes, force_confirm);
     }
     run_interactive_session(std::env::args().nth(1).unwrap_or_else(|| "mock".to_string()))
 }
@@ -55,31 +59,42 @@ fn load_manifest(source: &str) -> Result<Manifest, Box<dyn std::error::Error>> {
     }
 }
 
-/// `open <file-or-url>`: parse the manifest, show the session card, require
-/// explicit confirmation, then boot a session configured FROM the manifest —
-/// system prompt, backend, broker, cwd, setup commands, and the `run` launch
-/// (with `instructions` delivered to the agent) — before dropping into the REPL.
+/// `open <file-or-url>`: parse the manifest, show the session card, then boot a
+/// session configured FROM the manifest — system prompt, backend, broker, cwd,
+/// setup commands, and the `run` launch (with `instructions` delivered to the
+/// agent) — before dropping into the REPL.
 ///
-/// The card + confirm gate is the safety primitive: nothing runs until the user
-/// has seen exactly what will run and approved it — especially important when
-/// the manifest was fetched from a URL.
-fn run_manifest(source: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// A local manifest you invoked `open` on directly runs without a prompt (you
+/// chose the file). A manifest fetched from a URL always requires confirmation —
+/// that's the remote-exec safety gate. `--yes` skips the prompt; `--confirm`
+/// forces it for any source.
+fn run_manifest(
+    source: &str,
+    force_yes: bool,
+    force_confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let m = load_manifest(source)?;
+    let is_url = source.starts_with("http://") || source.starts_with("https://");
 
     // Auto-accept is derived from the system prompt, exactly as the interactive
     // session does it — never a separate manifest field.
     let auto_accept = wants_auto_accept(&m.system_prompt);
 
-    // Show the card and gate on confirmation BEFORE building or running
-    // anything. Read a single line from stdin (cooked mode — raw mode isn't
-    // enabled yet) and proceed only on an affirmative/empty answer.
+    // Always show the card (so there's a record of what's about to run); only
+    // block for confirmation when required (URL source, or --confirm).
     print!("{}", manifest::render_card(&m, auto_accept));
     std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    if !manifest::is_confirmed(&answer) {
-        println!("→ Aborted; nothing was run.");
-        return Ok(());
+    if confirmation_required(is_url, force_yes, force_confirm) {
+        print!("Launch this session? [Y/n] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !manifest::is_confirmed(&answer) {
+            println!("→ Aborted; nothing was run.");
+            return Ok(());
+        }
+    } else {
+        println!("→ auto-confirmed (local manifest; pass --confirm to require a prompt).");
     }
 
     let backend = build_backend(&m.backend);
@@ -173,6 +188,20 @@ fn run_manifest(source: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Single-quote a path for safe use as one shell word (cwd may contain spaces).
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Whether `open` must stop and ask before running. A local manifest the user
+/// invoked directly runs without a prompt; a manifest fetched from a URL always
+/// confirms (the remote-exec safety gate). `--yes` forces no prompt; `--confirm`
+/// forces one for any source.
+fn confirmation_required(is_url: bool, force_yes: bool, force_confirm: bool) -> bool {
+    if force_yes {
+        false
+    } else if force_confirm {
+        true
+    } else {
+        is_url
+    }
 }
 
 /// Build the LLM-fallback backend for the session. "anthropic"/"claude" use the
@@ -510,7 +539,21 @@ fn print_styled(
 
 #[cfg(test)]
 mod tests {
-    use super::{interactive_command, wants_auto_accept};
+    use super::{confirmation_required, interactive_command, wants_auto_accept};
+
+    #[test]
+    fn local_manifest_runs_without_prompt_url_confirms() {
+        // Local file, no flags → no prompt.
+        assert!(!confirmation_required(false, false, false));
+        // URL, no flags → confirm (the remote-exec gate).
+        assert!(confirmation_required(true, false, false));
+        // --yes skips the prompt even for a URL.
+        assert!(!confirmation_required(true, true, false));
+        // --confirm forces a prompt even for a local file.
+        assert!(confirmation_required(false, false, true));
+        // --yes wins over --confirm.
+        assert!(!confirmation_required(true, true, true));
+    }
 
     #[test]
     fn auto_accept_follows_system_prompt() {

@@ -81,14 +81,15 @@ Open it:
 mock-terminal open examples/session.json     # or:  open https://…/session.json
 ```
 
-It shows a **session card** and waits for confirmation before running anything —
-the safety gate, and exactly why a manifest fetched from a URL is never executed
-unreviewed. On confirm: the `system_prompt` becomes the session policy (so
-auto-accept + the Haiku broker engage as in interactive mode), it `cd`s into
-`cwd`, runs `setup`, then launches `run` with `instructions` delivered to the
-agent — via its native prompt flag where known (`claude "<task>"`,
-`codex exec "<task>"`) or typed in once an unknown agent's input settles —
-before dropping into the interactive prompt.
+It prints a **session card** showing exactly what will run. A **local** manifest
+you opened directly runs straight away (you chose the file); a manifest fetched
+from a **URL** requires a `[Y/n]` confirmation first — that's the remote-exec
+safety gate. Use `--yes` to skip the prompt or `--confirm` to force it for any
+source. Then the `system_prompt` becomes the session policy (so auto-accept +
+the Haiku broker engage as in interactive mode), it `cd`s into `cwd`, runs
+`setup`, and launches `run` with `instructions` delivered to the agent — via its
+native prompt flag where known (`claude "<task>"`, `codex exec "<task>"`) or
+typed in once an unknown agent's input settles — before dropping into the prompt.
 
 To open one in a **dedicated macOS Terminal window (or tab)** from another
 session — e.g. to fan out several agents in parallel — use the launcher:
@@ -123,7 +124,7 @@ clearly allow is escalated back to you instead of approved.
 ## Tests
 
 ```bash
-cargo test          # 59 unit + PTY integration tests
+cargo test          # 60 unit + PTY integration tests
 expect tests/smoke.exp     # end-to-end: shell, interrupt, passthrough, auto-accept
 expect tests/manifest.exp  # end-to-end: `open` renders card, confirms, runs
 ```
