@@ -46,6 +46,18 @@ impl AnthropicBackend {
             .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
         Ok(Self { api_key, model })
     }
+
+    /// Like `from_env` but pins a specific model, ignoring ANTHROPIC_MODEL. Used
+    /// by the policy broker so the cheap, fast grader is always Haiku regardless
+    /// of whatever heavier model the session's fallback backend uses.
+    pub fn from_env_with_model(model: &str) -> Result<Self, Box<dyn Error>> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .map_err(|_| "ANTHROPIC_API_KEY not set")?;
+        Ok(Self {
+            api_key,
+            model: model.to_string(),
+        })
+    }
 }
 
 impl Backend for AnthropicBackend {

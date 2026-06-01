@@ -1,3 +1,4 @@
+use crate::decider::{Decider, Decision};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::error::Error;
 use std::io::{Read, Write};
@@ -24,6 +25,9 @@ const AUTO_ACCEPT_IDLE: Duration = Duration::from_millis(600);
 const AUTO_ACCEPT_SETTLE: Duration = Duration::from_millis(1200);
 const AUTO_ACCEPT_COOLDOWN: Duration = Duration::from_millis(1500);
 const AUTO_ACCEPT_TAIL: usize = 8192;
+// After a Deny sends its primary reject ("2"), wait this long before falling
+// back to Escape if the program is still prompting.
+const AUTO_ACCEPT_DENY_FOLLOWUP: Duration = Duration::from_millis(500);
 
 pub struct Shell {
     writer: Box<dyn Write + Send>,
@@ -224,14 +228,19 @@ impl Shell {
     /// exits, then resynchronises back to capture mode.
     ///
     /// When `auto_accept` is set, known agents are launched with their native
-    /// permission-bypass flag, and for any other program the terminal injects
-    /// Enter whenever the program shows a prompt and goes idle.
+    /// permission-bypass flag, and for any other program the broker grades each
+    /// settled prompt: `decider.decide(tail, policy)` returns Approve / Deny /
+    /// Escalate, and we act accordingly (inject Enter, inject a reject, or hand
+    /// control back to the human). When `auto_accept` is off we never inject —
+    /// the `decider` and `policy` are ignored, same as before this feature.
     ///
     /// The outer terminal must already be in raw mode.
     pub fn run_interactive(
         &mut self,
         command: &str,
         auto_accept: bool,
+        decider: &dyn Decider,
+        policy: &str,
     ) -> Result<(), Box<dyn Error>> {
         let command = if auto_accept {
             with_auto_accept_flag(command)
@@ -273,6 +282,10 @@ impl Shell {
         let mut last_output = Instant::now();
         let mut last_inject = start - AUTO_ACCEPT_COOLDOWN;
         let mut prompt_seen_at: Option<Instant> = None;
+        // When a Deny sends its primary reject, we record when, so that — if the
+        // program is still prompting a moment later — we can follow up with an
+        // Escape as a fallback. Reset once the prompt clears or we follow up.
+        let mut deny_sent_at: Option<Instant> = None;
         loop {
             // Inner pty -> screen.
             let mut wrote = false;
@@ -292,18 +305,33 @@ impl Shell {
                 out.flush()?;
             }
 
-            // Auto-accept: inject Enter to take the default once a prompt is up.
-            // Fire when the program goes idle after the prompt, OR — for animated
-            // TUIs that never go idle (Claude Code redraws a spinner, hints,
-            // cursor) — once the prompt has been on screen long enough to have
-            // finished rendering.
+            // Auto-accept: once a prompt is up and has settled, ask the broker
+            // what to do instead of blindly accepting. Fire when the program
+            // goes idle after the prompt, OR — for animated TUIs that never go
+            // idle (Claude Code redraws a spinner, hints, cursor) — once the
+            // prompt has been on screen long enough to have finished rendering.
             if auto_accept {
                 let is_prompt = looks_like_prompt(&String::from_utf8_lossy(&tail));
                 if is_prompt {
                     prompt_seen_at.get_or_insert_with(Instant::now);
                 } else {
                     prompt_seen_at = None;
+                    deny_sent_at = None; // prompt cleared; cancel any deny follow-up
                 }
+
+                // Deny follow-up: if we sent the primary reject but the program
+                // is still prompting a moment later, send Escape once as a
+                // fallback (some prompts dismiss on Esc, not on a "2"). Heuristic.
+                if let Some(t) = deny_sent_at {
+                    if is_prompt && t.elapsed() > AUTO_ACCEPT_DENY_FOLLOWUP {
+                        self.writer.write_all(b"\x1b")?;
+                        self.writer.flush()?;
+                        deny_sent_at = None;
+                        prompt_seen_at = None;
+                        tail.clear();
+                    }
+                }
+
                 let idle = last_output.elapsed() > AUTO_ACCEPT_IDLE;
                 let settled =
                     prompt_seen_at.is_some_and(|t| t.elapsed() > AUTO_ACCEPT_SETTLE);
@@ -311,11 +339,40 @@ impl Shell {
                     && (idle || settled)
                     && last_inject.elapsed() > AUTO_ACCEPT_COOLDOWN
                 {
-                    self.writer.write_all(b"\r")?;
-                    self.writer.flush()?;
+                    let tail_text = String::from_utf8_lossy(&tail).into_owned();
+                    let decision = decider.decide(&tail_text, policy);
+                    // The cooldown applies to every settled decision (approve,
+                    // deny, escalate) so we never re-fire on the same prompt.
                     last_inject = Instant::now();
                     prompt_seen_at = None;
-                    tail.clear(); // require a fresh prompt before injecting again
+                    match decision_action(decision) {
+                        Action::Inject(bytes) => {
+                            self.writer.write_all(bytes)?;
+                            self.writer.flush()?;
+                            tail.clear(); // require a fresh prompt before deciding again
+                        }
+                        Action::Deny(bytes) => {
+                            self.writer.write_all(bytes)?;
+                            self.writer.flush()?;
+                            // Arm the Escape fallback in case "2" didn't dismiss it.
+                            deny_sent_at = Some(Instant::now());
+                            tail.clear();
+                        }
+                        Action::Escalate => {
+                            // Hand control to the human: don't inject anything.
+                            // Surface the reason on its own line; the cooldown
+                            // keeps this from spamming while the human reacts.
+                            let reason = decider.last_reason();
+                            let reason = if reason.is_empty() {
+                                "prompt not clearly allowed by policy".to_string()
+                            } else {
+                                reason
+                            };
+                            print_escalation(&mut out, &reason)?;
+                            // Keep the tail so we don't immediately re-detect and
+                            // re-escalate the same prompt within the cooldown.
+                        }
+                    }
                 }
             }
 
@@ -394,6 +451,50 @@ fn with_auto_accept_flag(command: &str) -> String {
         Some(f) if !command.contains(f) => format!("{command} {f}"),
         _ => command.to_string(),
     }
+}
+
+/// What `run_interactive` does for a graded decision. Split out as a pure
+/// mapping from `Decision` to concrete bytes/behaviour so it can be unit-tested
+/// without a live PTY.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// Inject these bytes and consider the prompt handled (Approve).
+    Inject(&'static [u8]),
+    /// Inject the primary reject bytes, then arm an Escape fallback (Deny).
+    Deny(&'static [u8]),
+    /// Inject nothing; hand control back to the human (Escalate).
+    Escalate,
+}
+
+/// Map a broker `Decision` to the action taken at a settled prompt.
+///
+/// - Approve: inject Enter (`\r`), preserving the original auto-accept.
+/// - Deny: inject "2\r" (the conventional "No / second option"); the caller
+///   follows up with Escape if the prompt persists. Heuristic: not every prompt
+///   maps "no" to option 2, hence the Esc fallback.
+/// - Escalate: inject nothing.
+fn decision_action(decision: Decision) -> Action {
+    match decision {
+        Decision::Approve => Action::Inject(b"\r"),
+        Decision::Deny => Action::Deny(b"2\r"),
+        Decision::Escalate => Action::Escalate,
+    }
+}
+
+/// Print a clearly-styled escalation line to the user mid-passthrough. Uses
+/// `\r\n` because the terminal is in raw mode during interactive sessions.
+fn print_escalation(out: &mut impl Write, reason: &str) -> Result<(), Box<dyn Error>> {
+    use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+    crossterm::execute!(
+        out,
+        Print("\r\n"),
+        SetForegroundColor(Color::Yellow),
+        Print(format!("· escalated to you: {reason}")),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Heuristic: does the trailing output look like a yes/no or selection prompt
@@ -504,6 +605,52 @@ fn find_end(text: &str, prefix: &str, suffix: &str) -> Option<(usize, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decider::MockDecider;
+
+    // The action taken at a settled prompt is a pure mapping from the broker's
+    // decision; verify it without a live PTY.
+    #[test]
+    fn approve_injects_enter() {
+        assert_eq!(decision_action(Decision::Approve), Action::Inject(b"\r"));
+    }
+
+    #[test]
+    fn deny_injects_reject_then_arms_escape() {
+        // Deny sends "2\r" as the primary reject; the Esc fallback is the byte
+        // the loop emits on follow-up (asserted via the constant below).
+        assert_eq!(decision_action(Decision::Deny), Action::Deny(b"2\r"));
+    }
+
+    #[test]
+    fn escalate_injects_nothing() {
+        assert_eq!(decision_action(Decision::Escalate), Action::Escalate);
+    }
+
+    // End-to-end at the decision level: a MockDecider's verdict maps to the
+    // expected action, so the broker -> action wiring is correct without a PTY.
+    #[test]
+    fn mock_decider_drives_action_mapping() {
+        let deny_rm = MockDecider::deny_if_contains("rm -rf");
+        // A dangerous prompt is denied -> reject bytes.
+        let danger = "Run `rm -rf /tmp`? ❯ 1. Yes  2. No";
+        assert_eq!(
+            decision_action(deny_rm.decide(danger, "deny rm -rf")),
+            Action::Deny(b"2\r")
+        );
+        // A benign prompt is approved -> Enter.
+        let benign = "Read file config.toml? ❯ 1. Yes  2. No";
+        assert_eq!(
+            decision_action(deny_rm.decide(benign, "deny rm -rf")),
+            Action::Inject(b"\r")
+        );
+
+        // An explicit escalate rule -> no injection.
+        let escalator = MockDecider::new(|_p, _policy| Decision::Escalate);
+        assert_eq!(
+            decision_action(escalator.decide(danger, "")),
+            Action::Escalate
+        );
+    }
 
     #[test]
     fn find_end_parses_exit_code() {

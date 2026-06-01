@@ -26,10 +26,14 @@ $ claude                  # interactive agent → full passthrough TUI
 - **Interactive passthrough.** Full-screen / REPL programs (`claude`, `vim`,
   `top`, `python`, …) get handed the raw terminal — arrows, escapes, Ctrl-keys
   all pass through. Prefix any command with `:` to force it.
-- **Auto-accept.** Opt in via the startup system prompt (type something with
-  "accept"). Known agents launch with their native permission-bypass flag;
-  everything else gets a watched-and-injected Enter when a prompt appears —
-  even animated TUIs that never go idle.
+- **Auto-accept with a model-graded policy broker.** Opt in via the startup
+  system prompt (type something with "accept"). Known agents launch with their
+  native permission-bypass flag; for everything else, when a prompt settles a
+  Haiku model grades it against your system prompt (the policy) and returns
+  **APPROVE** (inject Enter), **DENY** (inject a reject, then Escape as a
+  fallback), or **ESCALATE** (stop and hand control back to you). It fails safe:
+  any API error or unparseable reply escalates — it never approves on
+  uncertainty. With no API key it falls back to the old blind always-approve.
 - **Never wedges.** Hung or interactive commands can be interrupted with Ctrl-C;
   the process tree is SIGKILLed and the shell always recovers.
 
@@ -63,13 +67,17 @@ For interactive programs the terminal flips into **passthrough**: it resizes the
 inner PTY to your terminal, launches the program bare so it inherits the PTY as
 its controlling terminal, and shuttles raw bytes both ways until the program's
 process tree exits. Auto-accept watches the output stream for prompt patterns
-(`Do you want…`, `❯ 1. Yes`, `(y/n)`, …) and injects Enter once the prompt has
-settled — which is how it answers Claude Code's permission prompts unattended.
+(`Do you want…`, `❯ 1. Yes`, `(y/n)`, …); once a prompt has settled it asks the
+policy broker (`src/decider.rs`) what to do. The broker sends your system prompt
+plus the scraped prompt text to a Haiku model and parses a one-token verdict
+(APPROVE / DENY / ESCALATE), so permission prompts are answered according to
+your policy rather than blindly accepted — and anything the policy doesn't
+clearly allow is escalated back to you instead of approved.
 
 ## Tests
 
 ```bash
-cargo test          # 22 unit + PTY integration tests
+cargo test          # 33 unit + PTY integration tests
 expect tests/smoke.exp   # end-to-end: shell, interrupt, passthrough, auto-accept
 ```
 

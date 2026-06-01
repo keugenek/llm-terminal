@@ -1,7 +1,9 @@
 mod backend;
+mod decider;
 mod shell;
 
 use backend::{AnthropicBackend, Backend, MockBackend};
+use decider::{AlwaysApprove, Decider, HaikuDecider};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -57,8 +59,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut shell = Shell::spawn()?;
 
     // The system prompt drives auto-accept: if it asks to accept, interactive
-    // programs get auto-approved (native flag where known, else injected Enter).
+    // programs get auto-approved (native flag where known, else a graded
+    // decision on each prompt).
     let auto_accept = wants_auto_accept(&system_prompt);
+
+    // When auto-accept is on, build the policy broker. Prefer the model-graded
+    // Haiku decider (it weighs each prompt against the system prompt as policy);
+    // fall back to AlwaysApprove if there's no API key, preserving the old
+    // blind-accept behaviour rather than failing to auto-accept at all.
+    let decider: Box<dyn Decider> = if auto_accept {
+        match HaikuDecider::from_env() {
+            Ok(d) => Box::new(d),
+            Err(_) => {
+                println!("auto-accept: no API key, approving by default");
+                Box::new(AlwaysApprove)
+            }
+        }
+    } else {
+        // Never consulted when auto-accept is off; a cheap placeholder.
+        Box::new(AlwaysApprove)
+    };
 
     println!(
         "mock-terminal — backend: {} — shell commands run for real; unknown commands go to the LLM.",
@@ -69,14 +89,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
          prefix any command with ':' to force it."
     );
     if auto_accept {
-        println!("Auto-accept ON (from system prompt): interactive prompts are auto-approved.");
+        println!(
+            "Auto-accept ON (from system prompt): prompts graded by the {} policy broker.",
+            decider_name(&*decider)
+        );
     }
     println!("Ctrl-C interrupts a running command; /exit quits.");
 
     enable_raw_mode()?;
-    let result = repl(&mut shell, &*backend, &system_prompt, auto_accept);
+    let result = repl(&mut shell, &*backend, &system_prompt, auto_accept, &*decider);
     disable_raw_mode()?;
     result
+}
+
+/// A short label for the active decider, shown in the banner so it's clear
+/// whether prompts are being model-graded or blindly approved.
+fn decider_name(decider: &dyn Decider) -> &'static str {
+    // The escalation reason is empty before any decision for AlwaysApprove (it
+    // never escalates); distinguish on type via a downcast-free marker instead.
+    if decider.is_model_graded() {
+        "Haiku"
+    } else {
+        "always-approve"
+    }
 }
 
 /// Auto-accept is enabled when the system prompt expresses intent to accept
@@ -132,6 +167,7 @@ fn repl(
     backend: &dyn Backend,
     system: &str,
     auto_accept: bool,
+    decider: &dyn Decider,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = stdout();
 
@@ -176,9 +212,10 @@ fn repl(
         }
 
         // Interactive programs take over the terminal: hand the inner pty
-        // straight through instead of capturing output.
+        // straight through instead of capturing output. The system prompt is
+        // the policy the broker grades each settled prompt against.
         if let Some(cmd) = interactive_command(trimmed) {
-            shell.run_interactive(cmd, auto_accept)?;
+            shell.run_interactive(cmd, auto_accept, decider, system)?;
             continue;
         }
 
