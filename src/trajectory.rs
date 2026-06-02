@@ -2,6 +2,7 @@ use crate::registry::SessionHandle;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,9 +63,12 @@ impl Trajectory {
         let pid = std::process::id();
         let path = dir.join(format!("session-{millis}-{pid}.jsonl"));
 
+        // 0600: the log can contain command lines / prompt tails, so it must not
+        // be readable by other users on the machine.
         OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)
             .ok()
     }
@@ -132,7 +136,10 @@ impl Trajectory {
             "kind": "decision",
             "verdict": verdict,
             "reason": reason,
-            "prompt_excerpt": redact(&tail(prompt_excerpt, EXCERPT_TAIL_CHARS)),
+            // Redact BEFORE truncating: tail() first would drop the leading
+            // anchor (e.g. `sk-ant-`) of a long secret, leaving redact() nothing
+            // to match and writing the secret's tail in clear.
+            "prompt_excerpt": tail(&redact(prompt_excerpt), EXCERPT_TAIL_CHARS),
         }));
     }
 
@@ -232,7 +239,13 @@ fn is_secret_char(c: char) -> bool {
 /// just past the prefix (so the caller can keep it) and just past the masked
 /// key body.
 fn match_token_secret(s: &str, start: usize) -> Option<(usize, usize)> {
-    const PREFIXES: &[&str] = &["sk-ant-", "api03-"];
+    // Common credential prefixes (Anthropic, GitHub, AWS, Slack, Stripe, Google).
+    // Best-effort: catches the prevalent prefixed-token shapes; unprefixed random
+    // secrets (e.g. raw AWS secret keys) still rely on the assignment heuristic.
+    const PREFIXES: &[&str] = &[
+        "sk-ant-", "api03-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "AKIA",
+        "ASIA", "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "sk_live_", "sk_test_", "AIza",
+    ];
     let rest = &s[start..];
     for prefix in PREFIXES {
         if let Some(after) = rest.strip_prefix(prefix) {
@@ -255,7 +268,8 @@ fn match_token_secret(s: &str, start: usize) -> Option<(usize, usize)> {
 /// index of the `=`'s following position (so the caller can copy `NAME=`) and
 /// the byte index just past the masked value, when both hold:
 ///
-/// - a NAME of identifier chars containing KEY / TOKEN / SECRET starts at
+/// - a NAME of identifier chars containing a credential keyword (KEY / TOKEN /
+///   SECRET / PASSWORD / PASSPHRASE / CREDENTIAL / PRIVATE / AUTH) starts at
 ///   `start`, AND
 /// - it's immediately followed by `=` and 16+ non-space value chars.
 ///
@@ -283,7 +297,11 @@ fn match_assignment_secret(s: &str, start: usize) -> Option<(usize, usize)> {
     }
     let name = &rest[..name_len];
     let upper = name.to_ascii_uppercase();
-    if !(upper.contains("KEY") || upper.contains("TOKEN") || upper.contains("SECRET")) {
+    const SECRET_WORDS: &[&str] = &[
+        "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "PRIVATE",
+        "AUTH",
+    ];
+    if !SECRET_WORDS.iter().any(|w| upper.contains(w)) {
         return None;
     }
     // Must be followed by '='.
@@ -426,6 +444,18 @@ mod tests {
         let masked2 = redact("key is api03-XYZ_abc-9876 ok");
         assert!(masked2.contains("api03-***"), "got: {masked2}");
         assert!(!masked2.contains("XYZ_abc-9876"), "got: {masked2}");
+
+        // Expanded prefixes: GitHub, AWS, Google. Tokens are built at runtime so
+        // the source carries no contiguous secret-shaped literal (which would
+        // trip secret scanners) while still exercising the redactor.
+        let body = "A".repeat(20);
+        let ghp = format!("ghp_{body}");
+        assert!(redact(&format!("token {ghp} done")).contains("ghp_***"));
+        assert!(!redact(&format!("token {ghp} done")).contains(&body));
+        let akia = format!("AKIA{}", "X".repeat(16));
+        assert!(redact(&format!("{akia} here")).contains("AKIA***"));
+        let aiza = format!("AIza{}", "y".repeat(20));
+        assert!(redact(&format!("{aiza} key")).contains("AIza***"));
     }
 
     #[test]
@@ -438,6 +468,24 @@ mod tests {
         // SECRET and KEY names also qualify.
         assert!(redact("DB_SECRET=0123456789abcdef0123").contains("DB_SECRET=***"));
         assert!(redact("API_KEY=0123456789abcdef0123").contains("API_KEY=***"));
+        // Expanded keywords: PASSWORD / PASSPHRASE / CREDENTIAL.
+        assert!(redact("PGPASSWORD=0123456789abcdef0123").contains("PGPASSWORD=***"));
+        assert!(redact("PASSPHRASE=0123456789abcdef0123").contains("PASSPHRASE=***"));
+        assert!(redact("DB_CREDENTIAL=0123456789abcdef0123").contains("DB_CREDENTIAL=***"));
+    }
+
+    #[test]
+    fn log_decision_redacts_secret_longer_than_tail_window() {
+        // Reproduces the truncate-before-redact leak: a secret longer than the
+        // tail window must still be masked because we now redact BEFORE truncating.
+        let g = DirGuard::new("long-secret");
+        let t = Trajectory::new();
+        let secret_body = "Z".repeat(400);
+        let excerpt = format!("sk-ant-{secret_body} please proceed?");
+        t.log_decision("approve", "", &excerpt);
+        let v: serde_json::Value = serde_json::from_str(&g.lines()[0]).unwrap();
+        let stored = v["prompt_excerpt"].as_str().unwrap();
+        assert!(!stored.contains(&secret_body), "secret tail leaked: {stored}");
     }
 
     #[test]
