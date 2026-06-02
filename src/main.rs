@@ -91,11 +91,25 @@ fn run_manifest(
     print!("{}", manifest::render_card(&m, auto_accept));
     std::io::stdout().flush()?;
     if confirmation_required(is_url, force_yes, force_confirm) {
+        // Never auto-confirm a non-interactive stdin. At EOF (piped, `</dev/null`,
+        // CI/cron) `read_line` returns Ok(0) with an empty buffer, which
+        // `is_confirmed` would treat as a bare-Enter "yes" — silently bypassing
+        // the gate for exactly the remote (URL) manifests it's meant to protect.
+        // Require a real terminal here (or an explicit `--yes`).
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            println!(
+                "→ Refusing to run without confirmation: stdin is not a terminal. \
+                 Run it interactively, or pass --yes to confirm explicitly."
+            );
+            return Ok(());
+        }
         print!("Launch this session? [Y/n] ");
         std::io::stdout().flush()?;
         let mut answer = String::new();
-        std::io::stdin().lock().read_line(&mut answer)?;
-        if !manifest::is_confirmed(&answer) {
+        let n = std::io::stdin().lock().read_line(&mut answer)?;
+        // n == 0 is EOF (not a deliberate Enter) → abort.
+        if n == 0 || !manifest::is_confirmed(&answer) {
             println!("→ Aborted; nothing was run.");
             return Ok(());
         }
@@ -357,7 +371,24 @@ fn decider_name(decider: &dyn Decider) -> &'static str {
 /// (e.g. "accept requests", "auto-accept", "yes to everything").
 fn wants_auto_accept(system_prompt: &str) -> bool {
     let p = system_prompt.to_lowercase();
-    p.contains("accept") || p.contains("yes to ")
+    // Match an affirmative accept-intent, but skip an occurrence immediately
+    // negated (e.g. "do NOT accept", "never accept", "don't accept") so a
+    // cautious prompt doesn't silently enable auto-accept.
+    for kw in ["auto-accept", "auto accept", "accept", "yes to "] {
+        let mut from = 0;
+        while let Some(rel) = p[from..].find(kw) {
+            let idx = from + rel;
+            let before = p[..idx].trim_end();
+            let negated = ["not", "n't", "never", "dont", "no"]
+                .iter()
+                .any(|neg| before.ends_with(neg));
+            if !negated {
+                return true;
+            }
+            from = idx + kw.len();
+        }
+    }
+    false
 }
 
 /// Decide whether `input` should run in interactive passthrough rather than
@@ -612,6 +643,10 @@ mod tests {
         assert!(wants_auto_accept("say yes to all prompts"));
         assert!(!wants_auto_accept("be terse and helpful"));
         assert!(!wants_auto_accept(""));
+        // Negated mentions must NOT enable auto-accept.
+        assert!(!wants_auto_accept("do NOT accept destructive edits"));
+        assert!(!wants_auto_accept("never accept anything risky"));
+        assert!(!wants_auto_accept("don't accept without asking"));
     }
 
     #[test]

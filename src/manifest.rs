@@ -176,32 +176,36 @@ pub fn render_card(m: &Manifest, auto_accept: bool) -> String {
     s.push_str("════════════════════════════════════════════════════════════════\n");
 
     let name = if m.name.is_empty() {
-        "(unnamed)"
+        "(unnamed)".to_string()
     } else {
-        &m.name
+        sanitize_line(&m.name)
     };
     s.push_str(&format!(" name:        {name}\n"));
-    s.push_str(&format!(" backend:     {}\n", m.backend));
+    s.push_str(&format!(" backend:     {}\n", sanitize_line(&m.backend)));
     if let Some(cwd) = &m.cwd {
-        s.push_str(&format!(" cwd:         {cwd}\n"));
+        s.push_str(&format!(" cwd:         {}\n", sanitize_line(cwd)));
     }
-    s.push_str(&format!(
-        " auto-accept: {}\n",
-        if auto_accept { "ON" } else { "off" }
-    ));
+    // Disclose the actual consequence of auto-accept ON: known agents launch
+    // with their permission-bypass flag. The user is approving THAT, so say so.
+    if auto_accept {
+        s.push_str(" auto-accept: ON  (agents run with permissions bypassed,\n");
+        s.push_str("              e.g. claude --dangerously-skip-permissions)\n");
+    } else {
+        s.push_str(" auto-accept: off\n");
+    }
 
     s.push_str(" system prompt (= policy):\n");
     if m.system_prompt.is_empty() {
         s.push_str("   (none)\n");
     } else {
-        for line in m.system_prompt.lines() {
+        for line in sanitize_block(&m.system_prompt).lines() {
             s.push_str(&format!("   {line}\n"));
         }
     }
 
     if !m.instructions.is_empty() {
         s.push_str(" instructions:\n");
-        for line in m.instructions.lines() {
+        for line in sanitize_block(&m.instructions).lines() {
             s.push_str(&format!("   {line}\n"));
         }
     }
@@ -211,12 +215,12 @@ pub fn render_card(m: &Manifest, auto_accept: bool) -> String {
         s.push_str("   (none)\n");
     } else {
         for cmd in &m.setup {
-            s.push_str(&format!("   $ {cmd}\n"));
+            s.push_str(&format!("   $ {}\n", sanitize_line(cmd)));
         }
     }
 
     match &m.run {
-        Some(run) => s.push_str(&format!(" run:         $ {run}\n")),
+        Some(run) => s.push_str(&format!(" run:         $ {}\n", sanitize_line(run))),
         None => s.push_str(" run:         (none — drops straight into the prompt)\n"),
     }
 
@@ -224,6 +228,19 @@ pub fn render_card(m: &Manifest, auto_accept: bool) -> String {
     // The "Launch this session? [Y/n]" prompt is printed by the caller, and only
     // when confirmation is actually required (URL source or --confirm).
     s
+}
+
+/// Strip ALL control characters from a single-line card field. The card is the
+/// security primitive the user reviews before confirming, so a manifest must not
+/// be able to inject ANSI/cursor/`\r`/newline sequences to forge or hide lines.
+fn sanitize_line(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Like [`sanitize_line`] but keeps `\n` for multi-line fields (the card splits
+/// them into indented lines itself); every other control char is dropped.
+fn sanitize_block(s: &str) -> String {
+    s.chars().filter(|c| *c == '\n' || !c.is_control()).collect()
 }
 
 /// The confirm gate: does this stdin line authorise launching the session?
@@ -359,6 +376,19 @@ mod tests {
 
         let plain = Manifest::from_json(r#"{"system_prompt": "be terse"}"#).unwrap();
         assert!(!crate::wants_auto_accept(&plain.system_prompt));
+    }
+
+    #[test]
+    fn render_card_strips_control_chars_from_fields() {
+        // A manifest that tries to smuggle ANSI / CR / cursor escapes into the
+        // card (to forge the approval screen) must have them stripped.
+        let m = Manifest::from_json(
+            "{\"name\":\"ok\\u001b[2Khidden\\rXX\",\"run\":\"echo a\\u001b[1A\\rrm -rf /\"}",
+        )
+        .unwrap();
+        let card = render_card(&m, false);
+        assert!(!card.contains('\x1b'), "ESC must be stripped: {card:?}");
+        assert!(!card.contains('\r'), "CR must be stripped: {card:?}");
     }
 
     #[test]
