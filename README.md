@@ -145,7 +145,7 @@ clearly allow is escalated back to you instead of approved.
 ## Tests
 
 ```bash
-cargo test          # 68 unit + PTY integration tests
+cargo test          # 75 unit + PTY integration tests
 expect tests/smoke.exp     # end-to-end: shell, interrupt, passthrough, auto-accept
 expect tests/manifest.exp  # end-to-end: `open` renders card, confirms, runs
 expect tests/ps.exp        # end-to-end: `ps` tracks a session running → done
