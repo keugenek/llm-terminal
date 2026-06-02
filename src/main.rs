@@ -369,13 +369,25 @@ fn interactive_command(input: &str) -> Option<&str> {
         let rest = rest.trim();
         return (!rest.is_empty()).then_some(rest);
     }
+    let first = input.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    let extra = std::env::var("MT_INTERACTIVE").unwrap_or_default();
+    name_is_interactive(base, &extra).then_some(input)
+}
+
+/// Is `base` (a program basename) one we should run in passthrough? Built-in
+/// list plus any names from `extra` (the `MT_INTERACTIVE` env var, comma/space
+/// separated) — so you can route local interactive tools to passthrough without
+/// hardcoding their names in the source. Pure for testing.
+fn name_is_interactive(base: &str, extra: &str) -> bool {
     const INTERACTIVE: &[&str] = &[
         "claude", "vim", "vi", "nvim", "nano", "emacs", "top", "htop", "less", "more", "man",
         "ssh", "python", "python3", "ipython", "node", "irb", "psql", "mysql", "tmux", "screen",
     ];
-    let first = input.split_whitespace().next().unwrap_or("");
-    let base = first.rsplit('/').next().unwrap_or(first);
-    INTERACTIVE.contains(&base).then_some(input)
+    INTERACTIVE.contains(&base)
+        || extra
+            .split([',', ' '])
+            .any(|n| !n.is_empty() && n == base)
 }
 
 fn read_multiline_prompt() -> std::io::Result<String> {
@@ -622,5 +634,18 @@ mod tests {
         assert_eq!(interactive_command(":ls -la"), Some("ls -la"));
         assert_eq!(interactive_command(": cat"), Some("cat"));
         assert_eq!(interactive_command(":"), None);
+    }
+
+    #[test]
+    fn mt_interactive_extends_the_list() {
+        use super::name_is_interactive;
+        // Built-ins always match, regardless of the extra list.
+        assert!(name_is_interactive("claude", ""));
+        // A local tool not built in is routed once added via MT_INTERACTIVE.
+        assert!(!name_is_interactive("mytool", ""));
+        assert!(name_is_interactive("mytool", "mytool,othertool"));
+        assert!(name_is_interactive("othertool", "mytool othertool")); // space-sep too
+        // Non-members still don't match.
+        assert!(!name_is_interactive("ls", "mytool"));
     }
 }

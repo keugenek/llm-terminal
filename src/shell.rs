@@ -187,8 +187,10 @@ impl Shell {
                 }
             } else {
                 if Instant::now() > deadline {
-                    return Err("command did not terminate after repeated SIGKILL; \
-                                the shell may be unusable"
+                    return Err("command did not terminate after repeated SIGKILL — it is \
+                                likely an interactive tool that detaches its process tree. \
+                                Run it in passthrough instead: ':<command>' (or add its name \
+                                to MT_INTERACTIVE)."
                         .into());
                 }
                 if last_kill.elapsed() >= KILL_RETRY {
