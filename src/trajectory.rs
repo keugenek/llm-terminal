@@ -330,16 +330,23 @@ mod tests {
     use super::*;
     use std::io::BufRead;
 
+    // MT_TRAJECTORY_DIR is process-global, so tests that set it must not run
+    // concurrently or they clobber each other's dir. Serialise them on one lock
+    // held for the lifetime of the guard.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     // A guard that points MT_TRAJECTORY_DIR at a fresh temp dir for the test and
     // restores the previous value on drop. Tests must never write to the real
     // $HOME, and env vars are process-global, so set/restore carefully.
     struct DirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
         prev: Option<std::ffi::OsString>,
         dir: PathBuf,
     }
 
     impl DirGuard {
         fn new(name: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("MT_TRAJECTORY_DIR");
             let dir = std::env::temp_dir().join(format!(
                 "til-test-{}-{}-{}",
@@ -348,7 +355,11 @@ mod tests {
                 unix_millis()
             ));
             std::env::set_var("MT_TRAJECTORY_DIR", &dir);
-            Self { prev, dir }
+            Self {
+                _lock: lock,
+                prev,
+                dir,
+            }
         }
 
         /// The single .jsonl file written into the temp dir.
