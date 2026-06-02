@@ -1,6 +1,7 @@
 mod backend;
 mod decider;
 mod manifest;
+mod registry;
 mod shell;
 mod trajectory;
 
@@ -43,6 +44,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let force_yes = std::env::args().skip(3).any(|a| a == "--yes" || a == "-y");
         let force_confirm = std::env::args().skip(3).any(|a| a == "--confirm");
         return run_manifest(&source, force_yes, force_confirm);
+    }
+    // `ps` lists tracked sessions (one-shot, or live with --watch).
+    if std::env::args().nth(1).as_deref() == Some("ps") {
+        let watch = std::env::args().skip(2).any(|a| a == "--watch" || a == "-w");
+        return run_ps(watch);
     }
     run_interactive_session(std::env::args().nth(1).unwrap_or_else(|| "mock".to_string()))
 }
@@ -101,7 +107,10 @@ fn run_manifest(
     let decider = build_decider(auto_accept);
 
     let mut shell = Shell::spawn()?;
-    let trajectory = Trajectory::new();
+    // Register the session so it appears in `mock-terminal ps`. Label it with the
+    // manifest name, falling back to the source if unnamed.
+    let session_name = if m.name.is_empty() { source } else { &m.name };
+    let trajectory = Trajectory::new_session(session_name, "open", source);
     trajectory.log_manifest(&m.name);
 
     println!(
@@ -204,6 +213,35 @@ fn confirmation_required(is_url: bool, force_yes: bool, force_confirm: bool) -> 
     }
 }
 
+/// `ps`: print the tracked-session table once, or — with `--watch` — clear the
+/// screen and refresh it every second until Ctrl-C. Sessions self-report to the
+/// registry (`~/.til/sessions/`); `registry::list` reconciles them against live
+/// pids so a closed/crashed window shows as `dead`.
+fn run_ps(watch: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut out = stdout();
+    loop {
+        if watch {
+            // Clear screen + home cursor (standard ANSI, like `watch`/`top`).
+            write!(out, "\x1b[2J\x1b[H")?;
+            writeln!(out, "mock-terminal sessions — refresh 1s, Ctrl-C to stop\n")?;
+        }
+        write!(out, "{}", registry::render_table(&registry::list(), now_ms()))?;
+        out.flush()?;
+        if !watch {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Milliseconds since the Unix epoch (for session ages in `ps`).
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 /// Build the LLM-fallback backend for the session. "anthropic"/"claude" use the
 /// real API client, falling back to mock (with a notice) when it can't init;
 /// anything else is the mock backend. Shared by every entry point so the backend
@@ -285,10 +323,10 @@ fn run_interactive_session(backend_kind: String) -> Result<(), Box<dyn std::erro
     }
     println!("Ctrl-C interrupts a running command; /exit quits.");
 
-    // One trajectory log per session, threaded into the REPL and (via it) the
-    // interactive loop. It degrades to a no-op if it can't open its file, so it
-    // never blocks starting the terminal.
-    let trajectory = Trajectory::new();
+    // One trajectory log + registry record per session, threaded into the REPL
+    // and (via it) the interactive loop. Both degrade to no-ops if their files
+    // can't be opened, so they never block starting the terminal.
+    let trajectory = Trajectory::new_session("interactive session", "interactive", "");
 
     enable_raw_mode()?;
     let result = repl(

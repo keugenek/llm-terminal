@@ -103,6 +103,27 @@ It opens a titled window running `mock-terminal open <file-or-url>` (which shows
 its own card + confirm in that window); each session logs its trajectory under
 `~/.til/trajectories/` (JSONL). macOS only (uses `osascript`).
 
+## Tracking sessions
+
+Every session — whether you launched it here or spawned it in another window —
+registers itself in `~/.til/sessions/`. List them all from anywhere:
+
+```bash
+mock-terminal ps            # one-shot table of all sessions
+mock-terminal ps --watch    # live, refreshes every second (Ctrl-C to stop)
+```
+
+```
+SESSION                  STATE    PID      AGE       LAST
+fix flaky test           running  93060    1m        decision
+autonomy demo — fix add  done     49662    6m        command
+old-window               dead     12233    2h        launched
+```
+
+Each session is the authoritative source of its own record (status, pid, last
+event). `ps` reconciles those records against live PIDs, so a window you closed
+or a crashed run shows as `dead` rather than lingering as `running`.
+
 ## How it works
 
 A persistent `bash` runs inside a PTY. Each captured command is wrapped with
@@ -124,9 +145,10 @@ clearly allow is escalated back to you instead of approved.
 ## Tests
 
 ```bash
-cargo test          # 60 unit + PTY integration tests
+cargo test          # 68 unit + PTY integration tests
 expect tests/smoke.exp     # end-to-end: shell, interrupt, passthrough, auto-accept
 expect tests/manifest.exp  # end-to-end: `open` renders card, confirms, runs
+expect tests/ps.exp        # end-to-end: `ps` tracks a session running → done
 ```
 
 ## Built with Claude Code

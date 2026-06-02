@@ -1,0 +1,39 @@
+#!/usr/bin/env expect
+# End-to-end for `ps`: a launched session shows as `running` in the tracker, and
+# as `done` after it exits. Uses isolated MT_TIL_DIR / MT_TRAJECTORY_DIR.
+set timeout 15
+log_user 0
+set env(MT_TIL_DIR) /tmp/til-ps-test
+set env(MT_TRAJECTORY_DIR) /tmp/til-ps-traj
+exec rm -rf /tmp/til-ps-test /tmp/til-ps-traj
+
+# A minimal manifest: no run command, so `open` auto-confirms (local) and drops
+# straight into the prompt with the session registered.
+set f /tmp/ps-demo.json
+set fh [open $f w]
+puts $fh "{ \"name\": \"ps-demo\", \"backend\": \"mock\" }"
+close $fh
+
+spawn ./target/debug/mock-terminal open $f
+expect "$ "
+
+# While the session sits at its prompt, `ps` must list it as running.
+set out1 [exec ./target/debug/mock-terminal ps]
+if {[string match "*ps-demo*running*" $out1]} {
+    puts "PASS: ps lists the live session as running"
+} else {
+    puts "FAIL: ps did not show running session:\n$out1"; exit 1
+}
+
+send "/exit\r"
+expect eof
+after 400
+
+# After a clean exit the record flips to done.
+set out2 [exec ./target/debug/mock-terminal ps]
+if {[string match "*ps-demo*done*" $out2]} {
+    puts "PASS: ps shows the session done after exit"
+} else {
+    puts "FAIL: ps did not show done:\n$out2"; exit 1
+}
+puts "PASS: clean"

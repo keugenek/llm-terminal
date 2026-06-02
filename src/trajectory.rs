@@ -1,3 +1,4 @@
+use crate::registry::SessionHandle;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -24,17 +25,30 @@ pub struct Trajectory {
     // Behind a Mutex because the same `&Trajectory` is shared across the REPL
     // and the interactive loop; serialising writes keeps lines from interleaving.
     file: Mutex<Option<File>>,
+    // The session's registry record (for `mock-terminal ps`). `None` for the
+    // logger-only constructor used in tests; `Some` for real sessions. Each log
+    // call touches it (last activity); dropping it marks the session "done".
+    session: Option<SessionHandle>,
 }
 
 impl Trajectory {
-    /// Open (creating if needed) the session log file at
-    /// `~/.til/trajectories/session-<unix_millis>-<pid>.jsonl`, creating the
-    /// directory if missing. The base dir can be overridden with the
-    /// `MT_TRAJECTORY_DIR` env var (tests point this at a temp dir so they never
-    /// touch the real `$HOME`). Any failure degrades the logger to a no-op.
+    /// Logger-only constructor (no registry record). Used by tests; real
+    /// sessions use [`Trajectory::new_session`] so they appear in `ps`.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             file: Mutex::new(Self::open_file()),
+            session: None,
+        }
+    }
+
+    /// Open the JSONL log AND register the session in the tracker so it shows up
+    /// in `mock-terminal ps`. `name` labels the session, `kind` is "open" or
+    /// "interactive", `source` is the manifest path/URL (empty for interactive).
+    pub fn new_session(name: &str, kind: &str, source: &str) -> Self {
+        Self {
+            file: Mutex::new(Self::open_file()),
+            session: Some(SessionHandle::new(name, kind, source)),
         }
     }
 
@@ -126,6 +140,13 @@ impl Trajectory {
     /// and degrade the logger to a no-op: logging must never crash the session,
     /// and we must never write to the terminal's stdout/stderr.
     fn write(&self, value: serde_json::Value) {
+        // Mirror the event kind into the registry record as "last activity" so
+        // `ps` shows what each session most recently did.
+        if let Some(session) = &self.session {
+            if let Some(kind) = value.get("kind").and_then(|k| k.as_str()) {
+                session.touch(kind);
+            }
+        }
         let mut guard = match self.file.lock() {
             Ok(g) => g,
             // A poisoned lock means another writer panicked mid-write; treat the
