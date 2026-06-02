@@ -308,9 +308,18 @@ impl Shell {
         // program is still prompting a moment later — we can follow up with an
         // Escape as a fallback. Reset once the prompt clears or we follow up.
         let mut deny_sent_at: Option<Instant> = None;
+        // The exact tail we last escalated. While the on-screen prompt is
+        // unchanged we don't re-grade it — otherwise we'd re-escalate (re-calling
+        // the model, re-logging, re-printing) every cooldown while the human is
+        // still handling the prompt.
+        let mut escalated_tail: Option<String> = None;
         // Task delivery for an agent that takes its prompt interactively: type
         // it once the program settles, then clear so we never type it twice.
         let mut pending_input = pending_input;
+        // Did the program actually emit any output yet? Gates task delivery so we
+        // don't type into a program that hasn't drawn its input line. (A plain
+        // `last_output > start` is always true since last_output starts later.)
+        let mut saw_output = false;
         // Track output for idle detection whenever either path needs it.
         let track_output = broker_active || pending_input.is_some();
         loop {
@@ -320,6 +329,7 @@ impl Shell {
                 out.write_all(&chunk)?;
                 if track_output {
                     last_output = Instant::now();
+                    saw_output = true;
                 }
                 if broker_active {
                     tail.extend_from_slice(&chunk);
@@ -336,11 +346,10 @@ impl Shell {
 
             // Unattended task delivery: once the program has produced output and
             // then gone idle long enough to be waiting for input, type the task
-            // followed by Enter exactly once. Gated on having seen output so we
-            // don't fire into a program that hasn't drawn its input line yet.
+            // followed by Enter exactly once. Gated on having actually seen
+            // output so we don't fire into a program that hasn't drawn its input.
             if let Some(task) = pending_input {
-                let drew_something = last_output > start;
-                if drew_something && last_output.elapsed() > AUTO_ACCEPT_TASK_DELAY {
+                if saw_output && last_output.elapsed() > AUTO_ACCEPT_TASK_DELAY {
                     self.writer.write_all(task.as_bytes())?;
                     self.writer.write_all(b"\r")?;
                     self.writer.flush()?;
@@ -379,11 +388,15 @@ impl Shell {
                 let idle = last_output.elapsed() > AUTO_ACCEPT_IDLE;
                 let settled =
                     prompt_seen_at.is_some_and(|t| t.elapsed() > AUTO_ACCEPT_SETTLE);
+                let tail_text = String::from_utf8_lossy(&tail).into_owned();
+                let already_escalated = escalated_tail.as_deref() == Some(tail_text.as_str());
                 if is_prompt
                     && (idle || settled)
                     && last_inject.elapsed() > AUTO_ACCEPT_COOLDOWN
+                    // Don't re-grade a prompt we already escalated: wait until the
+                    // screen changes (the human acts) before deciding again.
+                    && !already_escalated
                 {
-                    let tail_text = String::from_utf8_lossy(&tail).into_owned();
                     let decision = decider.decide(&tail_text, policy);
                     // Record the verdict before acting: the scraped tail is the
                     // prompt excerpt, and the decider's reason explains the call.
@@ -401,6 +414,7 @@ impl Shell {
                         Action::Inject(bytes) => {
                             self.writer.write_all(bytes)?;
                             self.writer.flush()?;
+                            escalated_tail = None;
                             tail.clear(); // require a fresh prompt before deciding again
                         }
                         Action::Deny(bytes) => {
@@ -408,6 +422,7 @@ impl Shell {
                             self.writer.flush()?;
                             // Arm the Escape fallback in case "2" didn't dismiss it.
                             deny_sent_at = Some(Instant::now());
+                            escalated_tail = None;
                             tail.clear();
                         }
                         Action::Escalate => {
@@ -419,19 +434,22 @@ impl Shell {
                                 reason
                             };
                             print_escalation(&mut out, &reason)?;
-                            // If the broker is unreachable (e.g. a bad API key),
-                            // it will fail the same way on every prompt — so print
-                            // once and disable it for the rest of the session
-                            // rather than spamming the program's screen.
-                            if reason.contains("unreachable") {
+                            // Latch THIS prompt so we don't re-grade/re-escalate it
+                            // until the screen changes — the human is now handling
+                            // it. (We keep the tail so detection still sees it.)
+                            escalated_tail = Some(tail_text);
+                            // If the broker is unreachable (transport error, e.g. a
+                            // bad API key) it fails the same way on every prompt, so
+                            // disable it for the session rather than escalating each
+                            // one. Keyed on the decider's structured signal, never on
+                            // free-text reason wording.
+                            if decider.unreachable() {
                                 print_escalation(
                                     &mut out,
                                     "broker unreachable — disabling auto-accept for this session",
                                 )?;
                                 broker_active = false;
                             }
-                            // Keep the tail so we don't immediately re-detect and
-                            // re-escalate the same prompt within the cooldown.
                         }
                     }
                 }
@@ -584,7 +602,20 @@ fn print_escalation(out: &mut impl Write, reason: &str) -> Result<(), Box<dyn Er
 /// Heuristic: does the trailing output look like a yes/no or selection prompt
 /// that's waiting for the user? Used to decide when to inject an accept.
 fn looks_like_prompt(tail: &str) -> bool {
-    let t = tail.to_lowercase();
+    // A prompt sits at the BOTTOM of the screen, so only scan the last few
+    // non-empty lines. Scanning the whole 8 KB window matches the words below
+    // anywhere in scrollback/prose and causes false positives (e.g. an agent
+    // that merely says "approved" mid-output).
+    let recent: String = tail
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    // Needles are kept prompt-shaped (a question, a y/n, an option marker) rather
+    // than bare verbs, so ordinary prose doesn't read as a waiting prompt.
     const NEEDLES: &[&str] = &[
         "(y/n)",
         "[y/n]",
@@ -598,10 +629,11 @@ fn looks_like_prompt(tail: &str) -> bool {
         "1) yes",
         "❯ 1",
         "(use arrow keys)",
-        "approve",
+        "approve?",
+        "approve this",
         "allow this",
     ];
-    NEEDLES.iter().any(|n| t.contains(n))
+    NEEDLES.iter().any(|n| recent.contains(n))
 }
 
 /// True if `pid` currently has at least one direct child process.
@@ -826,6 +858,20 @@ mod tests {
     fn prompt_detection_option_menu() {
         let menu = "Which option would you like to pick?\n\n❯ 1. Option A\n  2. Option B\n  3. Option C\n";
         assert!(looks_like_prompt(menu));
+    }
+
+    #[test]
+    fn prompt_detection_ignores_prose_and_scrollback() {
+        // The bare word "approve(d)" in ordinary output is not a waiting prompt.
+        assert!(!looks_like_prompt("I approved the change and moved on.\nDone.\n"));
+        // A real approval prompt (question-shaped) still matches.
+        assert!(looks_like_prompt("Approve this action?"));
+        // A prompt far up in scrollback (not in the last lines) is not matched.
+        let mut scroll = String::from("Do you want to proceed?\n");
+        for i in 0..50 {
+            scroll.push_str(&format!("log line {i} doing routine work\n"));
+        }
+        assert!(!looks_like_prompt(&scroll), "stale prompt in scrollback must not match");
     }
 
     #[test]
