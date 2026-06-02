@@ -3,7 +3,7 @@ use crate::trajectory::Trajectory;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::error::Error;
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,8 +40,12 @@ pub struct Shell {
     counter: u64,
     command_timeout: Duration,
     child_pid: Option<u32>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
+    // The reader thread draining the master pty. Kept so Drop can join it after
+    // killing bash (which closes the slave → the reader hits EOF), instead of
+    // leaking the thread + an orphaned bash for the process's lifetime.
+    reader_handle: Option<thread::JoinHandle<()>>,
 }
 
 pub struct CommandResult {
@@ -77,7 +81,7 @@ impl Shell {
         let mut reader = pair.master.try_clone_reader()?;
 
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
+        let reader_handle = thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
@@ -104,8 +108,9 @@ impl Shell {
             counter: 0,
             command_timeout,
             child_pid,
-            _child: child,
+            child,
             master: pair.master,
+            reader_handle: Some(reader_handle),
         };
 
         shell.writer.write_all(b"stty -echo -onlcr 2>/dev/null\n")?;
@@ -469,13 +474,14 @@ impl Shell {
             // of bash, so they don't keep us here.
             if last_child_check.elapsed() >= Duration::from_millis(150) {
                 last_child_check = Instant::now();
-                let alive = self.child_pid.map(has_children).unwrap_or(false);
-                if alive {
-                    child_seen = true;
-                } else if child_seen {
-                    break;
-                } else if start.elapsed() > Duration::from_secs(3) {
-                    break; // builtin / instant command that never forked
+                // None = the pgrep probe itself failed (EAGAIN/EINTR under load).
+                // Treat that as "unknown", never as "exited" — otherwise a single
+                // flaky probe would abandon a still-running program.
+                match self.child_pid.and_then(has_children) {
+                    Some(true) => child_seen = true,
+                    Some(false) if child_seen => break,
+                    Some(false) if start.elapsed() > Duration::from_secs(3) => break,
+                    _ => {} // Some(false) before any child, or None (unknown)
                 }
             }
         }
@@ -514,6 +520,20 @@ impl Shell {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        // Kill bash so it can't linger as an orphan, then join the reader thread.
+        // Killing bash closes the slave pty, so the reader's blocking read() hits
+        // EOF and the thread exits — otherwise it (and bash) would leak for the
+        // rest of the process's life. portable-pty's Child does NOT kill on its
+        // own Drop, so we must do it explicitly.
+        let _ = self.child.kill();
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -637,13 +657,13 @@ fn looks_like_prompt(tail: &str) -> bool {
 }
 
 /// True if `pid` currently has at least one direct child process.
-fn has_children(pid: u32) -> bool {
-    Command::new("pgrep")
-        .arg("-P")
-        .arg(pid.to_string())
-        .output()
-        .map(|o| o.stdout.iter().any(|b| !b.is_ascii_whitespace()))
-        .unwrap_or(false)
+/// `Some(true)`/`Some(false)` if `pgrep -P pid` ran and (didn't) find children;
+/// `None` if the probe itself failed to run (so the caller can treat it as
+/// "unknown" rather than "no children").
+fn has_children(pid: u32) -> Option<bool> {
+    let out = Command::new("pgrep").arg("-P").arg(pid.to_string()).output().ok()?;
+    // pgrep exits 0 with matches, 1 with none, >1 on error. Trust stdout content.
+    Some(out.stdout.iter().any(|b| !b.is_ascii_whitespace()))
 }
 
 /// Non-blocking read of raw bytes from stdin (fd 0), waiting up to `timeout`.
@@ -691,14 +711,13 @@ fn kill_descendants(root: u32) {
         }
     }
     for pid in victims.iter().rev() {
-        // Ignore failures: a child may have exited between the pgrep scan and
-        // here. Silence stdio so "No such process" never leaks to our terminal.
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Signal directly via libc rather than shelling out to `kill`: no PATH
+        // dependency (a shadowed `kill` can't be invoked), no stdio to silence,
+        // and a smaller scan→signal window. A child that already exited just
+        // yields ESRCH, which we ignore.
+        if *pid != 0 && *pid <= i32::MAX as u32 {
+            unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+        }
     }
 }
 
