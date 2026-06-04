@@ -82,9 +82,10 @@ fn run_manifest(
     let m = load_manifest(source)?;
     let is_url = source.starts_with("http://") || source.starts_with("https://");
 
-    // Auto-accept is derived from the system prompt, exactly as the interactive
-    // session does it — never a separate manifest field.
-    let auto_accept = wants_auto_accept(&m.system_prompt);
+    // Auto-accept is derived from the system prompt (as the interactive session
+    // does it); a manifest's `auto_approve` also implies it (you can't blind-
+    // approve prompts without auto-accept being on).
+    let auto_accept = wants_auto_accept(&m.system_prompt) || m.auto_approve;
 
     // Always show the card (so there's a record of what's about to run); only
     // block for confirmation when required (URL source, or --confirm).
@@ -118,7 +119,7 @@ fn run_manifest(
     }
 
     let backend = build_backend(&m.backend);
-    let decider = build_decider(auto_accept);
+    let decider = build_decider(auto_accept, blind_approve_requested(m.auto_approve));
 
     let mut shell = Shell::spawn()?;
     // Register the session so it appears in `mock-terminal ps`. Label it with the
@@ -278,16 +279,16 @@ fn build_backend(kind: &str) -> Box<dyn Backend> {
 /// API key (preserving the old behaviour rather than failing to auto-accept).
 /// When auto-accept is off the decider is never consulted, so a cheap
 /// AlwaysApprove placeholder is fine. Shared across all entry points.
-fn build_decider(auto_accept: bool) -> Box<dyn Decider> {
+fn build_decider(auto_accept: bool, blind: bool) -> Box<dyn Decider> {
     if !auto_accept {
         return Box::new(AlwaysApprove);
     }
-    // Explicit blind-approve opt-in: approve EVERY prompt with no model grading.
-    // For full unattended autonomy when you don't have a working grader key. This
-    // is a deliberate "rubber stamp" — it bypasses the policy entirely — so it's
-    // off unless the user asks for it, and announced loudly below.
-    if std::env::var_os("MT_AUTO_APPROVE").is_some() {
-        println!("⚠ MT_AUTO_APPROVE: approving ALL interactive prompts WITHOUT policy grading.");
+    // Blind approve (MT_AUTO_APPROVE env or a manifest's auto_approve): approve
+    // EVERY prompt with no model grading — full unattended autonomy when you have
+    // no grader key. A deliberate "rubber stamp" that bypasses the policy, so
+    // it's off unless asked for, and announced loudly.
+    if blind {
+        println!("⚠ auto_approve: approving ALL interactive prompts WITHOUT policy grading.");
         return Box::new(AlwaysApprove);
     }
     match HaikuDecider::from_env() {
@@ -299,6 +300,12 @@ fn build_decider(auto_accept: bool) -> Box<dyn Decider> {
             Box::new(AlwaysApprove)
         }
     }
+}
+
+/// Blind auto-approve is requested by the MT_AUTO_APPROVE env var or (per
+/// session) a manifest's `auto_approve` field.
+fn blind_approve_requested(manifest_auto_approve: bool) -> bool {
+    manifest_auto_approve || std::env::var_os("MT_AUTO_APPROVE").is_some()
 }
 
 fn run_interactive_session(backend_kind: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -328,7 +335,7 @@ fn run_interactive_session(backend_kind: String) -> Result<(), Box<dyn std::erro
     // decision on each prompt). When on, build the policy broker (model-graded
     // Haiku, or blind AlwaysApprove without an API key).
     let auto_accept = wants_auto_accept(&system_prompt);
-    let decider = build_decider(auto_accept);
+    let decider = build_decider(auto_accept, blind_approve_requested(false));
 
     println!(
         "mock-terminal — backend: {} — shell commands run for real; unknown commands go to the LLM.",
@@ -629,7 +636,20 @@ fn print_styled(
 
 #[cfg(test)]
 mod tests {
-    use super::{confirmation_required, interactive_command, wants_auto_accept};
+    use super::{
+        blind_approve_requested, build_decider, confirmation_required, interactive_command,
+        wants_auto_accept,
+    };
+
+    #[test]
+    fn blind_approve_yields_non_graded_decider() {
+        // Blind requested → AlwaysApprove (not model-graded), regardless of key.
+        assert!(!build_decider(true, true).is_model_graded());
+        // Auto-accept off → AlwaysApprove placeholder, never consulted.
+        assert!(!build_decider(false, false).is_model_graded());
+        // The manifest field or the env var both request blind approve.
+        assert!(blind_approve_requested(true));
+    }
 
     #[test]
     fn local_manifest_runs_without_prompt_url_confirms() {

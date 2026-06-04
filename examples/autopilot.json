@@ -1,0 +1,9 @@
+{
+  "name": "autopilot — fully unattended",
+  "system_prompt": "complete the task autonomously",
+  "instructions": "Do the task end to end without stopping for confirmation.",
+  "backend": "mock",
+  "cwd": "/path/to/repo",
+  "auto_approve": true,
+  "run": "claude"
+}

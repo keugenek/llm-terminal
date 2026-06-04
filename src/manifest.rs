@@ -33,6 +33,10 @@ pub struct Manifest {
     pub instructions: String,
     /// LLM-fallback backend kind: "mock" or "anthropic". Defaults to "mock".
     pub backend: String,
+    /// Blind auto-approve: answer EVERY interactive prompt with no policy
+    /// grading (a deliberate rubber stamp, like MT_AUTO_APPROVE). Implies
+    /// auto-accept. Defaults to false; disclosed loudly on the card.
+    pub auto_approve: bool,
     /// Optional working directory to `cd` into before setup/run, so the launched
     /// agent operates in the right repo. `None` when absent.
     pub cwd: Option<String>,
@@ -90,6 +94,12 @@ impl Manifest {
             s => Some(s),
         };
 
+        let auto_approve = match obj.get("auto_approve") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(_) => return Err("field `auto_approve` must be a boolean".into()),
+        };
+
         let setup = match obj.get("setup") {
             None | Some(serde_json::Value::Null) => Vec::new(),
             Some(serde_json::Value::Array(items)) => items
@@ -115,6 +125,7 @@ impl Manifest {
             system_prompt,
             instructions,
             backend,
+            auto_approve,
             cwd,
             setup,
             run,
@@ -187,7 +198,12 @@ pub fn render_card(m: &Manifest, auto_accept: bool) -> String {
     }
     // Disclose the actual consequence of auto-accept ON: known agents launch
     // with their permission-bypass flag. The user is approving THAT, so say so.
-    if auto_accept {
+    // auto_approve is even louder — it rubber-stamps EVERY prompt with no grading.
+    if m.auto_approve {
+        s.push_str(" auto-accept: ON — ⚠ BLIND: every prompt approved with NO\n");
+        s.push_str("              policy grading (auto_approve), plus agents run\n");
+        s.push_str("              with permissions bypassed.\n");
+    } else if auto_accept {
         s.push_str(" auto-accept: ON  (agents run with permissions bypassed,\n");
         s.push_str("              e.g. claude --dangerously-skip-permissions)\n");
     } else {
@@ -389,6 +405,19 @@ mod tests {
         let card = render_card(&m, false);
         assert!(!card.contains('\x1b'), "ESC must be stripped: {card:?}");
         assert!(!card.contains('\r'), "CR must be stripped: {card:?}");
+    }
+
+    #[test]
+    fn auto_approve_parses_and_is_disclosed() {
+        assert!(!Manifest::from_json("{}").unwrap().auto_approve);
+        assert!(Manifest::from_json(r#"{"auto_approve": true}"#).unwrap().auto_approve);
+        assert!(!Manifest::from_json(r#"{"auto_approve": false}"#).unwrap().auto_approve);
+        // Wrong type is rejected.
+        assert!(Manifest::from_json(r#"{"auto_approve": "yes"}"#).is_err());
+        // The card must loudly disclose the blind rubber stamp.
+        let m = Manifest::from_json(r#"{"auto_approve": true}"#).unwrap();
+        let card = render_card(&m, true);
+        assert!(card.contains("BLIND"), "card must disclose blind approve: {card}");
     }
 
     #[test]

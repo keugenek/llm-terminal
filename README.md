@@ -95,6 +95,12 @@ the Haiku broker engage as in interactive mode), it `cd`s into `cwd`, runs
 native prompt flag where known (`claude "<task>"`, `codex exec "<task>"`) or
 typed in once an unknown agent's input settles — before dropping into the prompt.
 
+For fully unattended runs, set `"auto_approve": true` in the manifest (see
+`examples/autopilot.json`). It implies auto-accept and blind-approves every
+prompt with no policy grading — the same rubber stamp as `MT_AUTO_APPROVE=1`,
+disclosed loudly on the card. Use it only when you accept that the policy is
+bypassed.
+
 To open one in a **dedicated macOS Terminal window (or tab)** from another
 session — e.g. to fan out several agents in parallel — use the launcher:
 
