@@ -279,16 +279,25 @@ fn build_backend(kind: &str) -> Box<dyn Backend> {
 /// When auto-accept is off the decider is never consulted, so a cheap
 /// AlwaysApprove placeholder is fine. Shared across all entry points.
 fn build_decider(auto_accept: bool) -> Box<dyn Decider> {
-    if auto_accept {
-        match HaikuDecider::from_env() {
-            Ok(d) => Box::new(d),
-            Err(_) => {
-                println!("auto-accept: no API key, approving by default");
-                Box::new(AlwaysApprove)
-            }
+    if !auto_accept {
+        return Box::new(AlwaysApprove);
+    }
+    // Explicit blind-approve opt-in: approve EVERY prompt with no model grading.
+    // For full unattended autonomy when you don't have a working grader key. This
+    // is a deliberate "rubber stamp" — it bypasses the policy entirely — so it's
+    // off unless the user asks for it, and announced loudly below.
+    if std::env::var_os("MT_AUTO_APPROVE").is_some() {
+        println!("⚠ MT_AUTO_APPROVE: approving ALL interactive prompts WITHOUT policy grading.");
+        return Box::new(AlwaysApprove);
+    }
+    match HaikuDecider::from_env() {
+        Ok(d) => Box::new(d),
+        Err(_) => {
+            // No API key at all → fall back to blind approve (the historical
+            // behavior) rather than failing to auto-accept.
+            println!("auto-accept: no API key, approving by default");
+            Box::new(AlwaysApprove)
         }
-    } else {
-        Box::new(AlwaysApprove)
     }
 }
 

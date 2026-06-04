@@ -34,6 +34,10 @@ $ claude                  # interactive agent → full passthrough TUI
   fallback), or **ESCALATE** (stop and hand control back to you). It fails safe:
   any API error or unparseable reply escalates — it never approves on
   uncertainty. With no API key it falls back to the old blind always-approve.
+  Set **`MT_AUTO_APPROVE=1`** for full unattended autonomy: approve every prompt
+  with no grading at all (a deliberate rubber stamp — use only when you accept
+  that the policy is bypassed; `claude` already runs with its own
+  `--dangerously-skip-permissions` under auto-accept).
 - **Never wedges.** Hung or interactive commands can be interrupted with Ctrl-C;
   the process tree is SIGKILLed and the shell always recovers.
 
