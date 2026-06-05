@@ -25,7 +25,7 @@ const KILL_TOTAL_GRACE: Duration = Duration::from_secs(5);
 const AUTO_ACCEPT_IDLE: Duration = Duration::from_millis(600);
 const AUTO_ACCEPT_SETTLE: Duration = Duration::from_millis(1200);
 const AUTO_ACCEPT_COOLDOWN: Duration = Duration::from_millis(1500);
-const AUTO_ACCEPT_TAIL: usize = 8192;
+const AUTO_ACCEPT_TAIL: usize = 16384;
 // After a Deny sends its primary reject ("2"), wait this long before falling
 // back to Escape if the program is still prompting.
 const AUTO_ACCEPT_DENY_FOLLOWUP: Duration = Duration::from_millis(500);
@@ -636,18 +636,14 @@ fn print_escalation(out: &mut impl Write, reason: &str) -> Result<(), Box<dyn Er
 /// Heuristic: does the trailing output look like a yes/no or selection prompt
 /// that's waiting for the user? Used to decide when to inject an accept.
 fn looks_like_prompt(tail: &str) -> bool {
-    // A prompt sits at the BOTTOM of the screen, so only scan the last few
-    // non-empty lines. Scanning the whole 8 KB window matches the words below
-    // anywhere in scrollback/prose and causes false positives (e.g. an agent
-    // that merely says "approved" mid-output).
-    let recent: String = tail
-        .lines()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(4)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
+    // Full-screen TUIs (Claude Code) draw with ANSI/cursor-positioning, not
+    // newlines, so the raw bytes are escape-laden and rarely line-oriented.
+    // Strip the escapes first to get the visible text, then scan the tail end
+    // (prompts sit at the bottom of the screen). Scanning a bounded window — not
+    // the whole frame — avoids matching the words below in scrollback/prose.
+    let clean = strip_ansi(tail).to_lowercase();
+    let n = clean.chars().count();
+    let recent: String = clean.chars().skip(n.saturating_sub(PROMPT_SCAN_CHARS)).collect();
     // Needles are kept prompt-shaped (a question, a y/n, an option marker) rather
     // than bare verbs, so ordinary prose doesn't read as a waiting prompt.
     const NEEDLES: &[&str] = &[
@@ -662,12 +658,65 @@ fn looks_like_prompt(tail: &str) -> bool {
         "1. yes",
         "1) yes",
         "❯ 1",
+        "❯ 1.",
         "(use arrow keys)",
         "approve?",
         "approve this",
         "allow this",
     ];
     NEEDLES.iter().any(|n| recent.contains(n))
+}
+
+/// How many trailing (ANSI-stripped) characters of the output to scan for a
+/// prompt. Covers the bottom of a full screen without reaching into scrollback.
+const PROMPT_SCAN_CHARS: usize = 1500;
+
+/// Remove ANSI escape sequences (CSI `ESC [ … letter`, OSC `ESC ] … BEL/ST`) and
+/// other control characters from `s`, keeping visible text and newlines. Used so
+/// prompt detection sees what's on screen, not the raw escape stream.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    // CSI: consume params until the final byte (0x40–0x7e).
+                    chars.next();
+                    while let Some(&nc) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&nc) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: consume until BEL, or stop before a terminating ESC.
+                    chars.next();
+                    while let Some(&nc) = chars.peek() {
+                        if nc == '\u{07}' {
+                            chars.next();
+                            break;
+                        }
+                        if nc == '\u{1b}' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                // Lone ESC or a two-char escape: drop the following char too.
+                _ => {
+                    chars.next();
+                }
+            }
+        } else if c == '\n' {
+            out.push('\n');
+        } else if !c.is_control() {
+            out.push(c);
+        }
+        // other control chars (\r, BEL, …) are dropped
+    }
+    out
 }
 
 /// True if `pid` currently has at least one direct child process.
@@ -906,6 +955,22 @@ mod tests {
     fn prompt_detection_option_menu() {
         let menu = "Which option would you like to pick?\n\n❯ 1. Option A\n  2. Option B\n  3. Option C\n";
         assert!(looks_like_prompt(menu));
+    }
+
+    #[test]
+    fn prompt_detection_sees_through_ansi_cursor_positioning() {
+        // A Claude-Code-style frame: cursor moves + clears + colors, NO newlines
+        // between visual lines. Raw substring/line scanning would miss it; after
+        // strip_ansi the visible question is present and detected.
+        let frame = "\u{1b}[?25l\u{1b}[2J\u{1b}[3;1H\u{1b}[2K Contains simple_expansion\
+                     \u{1b}[5;1H\u{1b}[2K Do you want to proceed?\
+                     \u{1b}[6;1H \u{1b}[7m❯ 1. Yes\u{1b}[0m\u{1b}[7;1H   2. No\
+                     \u{1b}[9;1H Esc to cancel · Tab to amend";
+        assert!(looks_like_prompt(frame), "ANSI/cursor-positioned prompt must be detected");
+        // strip_ansi keeps the visible text and drops the escapes.
+        let clean = strip_ansi(frame);
+        assert!(clean.contains("Do you want to proceed?"), "got: {clean:?}");
+        assert!(!clean.contains('\u{1b}'), "escapes stripped");
     }
 
     #[test]
