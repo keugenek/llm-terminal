@@ -262,15 +262,19 @@ impl Shell {
         pending_input: Option<&str>,
     ) -> Result<(), Box<dyn Error>> {
         // When auto-accept is on, prefer a known agent's native permission-bypass
-        // flag (claude/codex). If one is applied, the agent handles its own
-        // permissions and shows no prompts to grade — so the output-scanning
-        // broker must stay OFF, or it false-positives on the agent's normal TUI
-        // chrome (e.g. `❯ 1`, mode/effort selectors) and spams escalations. The
-        // broker only runs as a fallback for auto-accept programs that did NOT
-        // get a native flag.
+        // flag (claude --dangerously-skip-permissions). Whether the output-scanning
+        // broker ALSO runs depends on the decider — see `broker_should_run`:
+        //  - model-graded (Haiku): OFF for native-bypass agents, so it doesn't
+        //    false-positive on the agent's TUI chrome and spam the API; the flag
+        //    handles real permission prompts.
+        //  - blind always-approve: ON even for native-bypass agents, because the
+        //    flag does NOT suppress managed/host security prompts (e.g. a
+        //    sandbox's "Do you want to proceed?"). The broker injects Enter to
+        //    answer those, which is exactly the blind-approve intent.
         let (command, mut broker_active) = if auto_accept {
             let native_bypass = applies_native_bypass(command);
-            (with_auto_accept_flag(command), !native_bypass)
+            let run = broker_should_run(true, native_bypass, decider.is_model_graded());
+            (with_auto_accept_flag(command), run)
         } else {
             (command.to_string(), false)
         };
@@ -565,6 +569,16 @@ fn applies_native_bypass(command: &str) -> bool {
     native_bypass_flag(command).is_some()
 }
 
+/// Whether the output-scanning broker should run. Off when auto-accept is off.
+/// On for programs without a native bypass flag. For native-bypass agents
+/// (claude): OFF under a model-graded decider (the flag handles prompts; the
+/// broker would only false-positive + spam the API), but ON under a blind
+/// always-approve decider — because the flag does NOT suppress managed/host
+/// security prompts, and blind-approve means we want Enter injected on those.
+fn broker_should_run(auto_accept: bool, native_bypass: bool, model_graded: bool) -> bool {
+    auto_accept && (!native_bypass || !model_graded)
+}
+
 /// What `run_interactive` does for a graded decision. Split out as a pure
 /// mapping from `Decision` to concrete bytes/behaviour so it can be unit-tested
 /// without a live PTY.
@@ -756,6 +770,21 @@ mod tests {
         assert!(applies_native_bypass(
             "claude --dangerously-skip-permissions"
         ));
+    }
+
+    #[test]
+    fn broker_runs_for_blind_approve_even_on_native_agents() {
+        // Non-native agent: broker always runs under auto-accept.
+        assert!(broker_should_run(true, false, true));
+        assert!(broker_should_run(true, false, false));
+        // Native-bypass agent (claude) + model-graded decider: broker OFF
+        // (avoid false-positive/API spam; the flag handles real prompts).
+        assert!(!broker_should_run(true, true, true));
+        // Native-bypass agent + blind always-approve: broker ON, so it can
+        // answer managed/host prompts the flag doesn't suppress.
+        assert!(broker_should_run(true, true, false));
+        // Auto-accept off: never runs.
+        assert!(!broker_should_run(false, false, false));
     }
 
     // The action taken at a settled prompt is a pure mapping from the broker's
