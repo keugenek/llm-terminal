@@ -25,7 +25,8 @@ $ claude                  # interactive agent → full passthrough TUI
   printed inline.
 - **Interactive passthrough.** Full-screen / REPL programs (`claude`, `vim`,
   `top`, `python`, …) get handed the raw terminal — arrows, escapes, Ctrl-keys
-  all pass through. Prefix any command with `:` to force it.
+  all pass through. Prefix any command with `:` to force it, or add names via
+  `MT_INTERACTIVE`.
 - **Auto-accept with a model-graded policy broker.** Opt in via the startup
   system prompt (type something with "accept"). Known agents launch with their
   native permission-bypass flag; for everything else, when a prompt settles a
@@ -38,6 +39,16 @@ $ claude                  # interactive agent → full passthrough TUI
   with no grading at all (a deliberate rubber stamp — use only when you accept
   that the policy is bypassed; `claude` already runs with its own
   `--dangerously-skip-permissions` under auto-accept).
+- **Prompt detection works through full-screen TUIs.** Real agent UIs (like
+  Claude Code) paint their prompts with ANSI cursor-positioning, not plain
+  newlines. The detector strips ANSI escapes first and scans the visible tail of
+  the screen, so prompts buried in a redrawn TUI are still recognized.
+- **Session manifests.** Hand it one self-contained JSON file (or a URL to one)
+  describing the policy, the task, the working dir, and the agent to launch —
+  see [Sessions](#sessions--launch-a-pre-configured-agent-run-from-a-file-or-url).
+- **Session tracking.** Every run registers itself; `mock-terminal ps` lists all
+  live and finished sessions across windows — see [Tracking
+  sessions](#tracking-sessions).
 - **Never wedges.** Hung or interactive commands can be interrupted with Ctrl-C;
   the process tree is SIGKILLed and the shell always recovers.
 
@@ -60,6 +71,25 @@ Ctrl-C              # interrupt a running command (or exit at the prompt)
 /exit               # quit
 ```
 
+The single positional argument selects the LLM-fallback backend:
+`mock` (default) or `anthropic` (alias `claude`).
+
+## Configuration
+
+All configuration is via environment variables — nothing is written to a config
+file.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | _(unset)_ | API key for the `anthropic` fallback backend **and** the Haiku policy broker. Without it, auto-accept falls back to blind always-approve. |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Model for the `anthropic` fallback backend. The policy broker always grades with Haiku regardless of this. |
+| `MT_AUTO_APPROVE` | _(unset)_ | If set to **any** value, blind-approve every prompt with no policy grading (rubber stamp). Presence-only — the value is ignored. |
+| `MT_INTERACTIVE` | _(empty)_ | Extra command names (comma/space-separated) to always treat as interactive passthrough, on top of the built-in list. |
+| `MT_TIMEOUT_SECS` | `30` | Timeout in seconds for a captured (non-interactive) command before it's interrupted. |
+| `MT_TRAJECTORY_DIR` | `~/.til/trajectories` | Directory for per-session trajectory JSONL logs (files land directly under it). |
+| `MT_TIL_DIR` | `~/.til` | Base dir for the session registry; records live in `<MT_TIL_DIR>/sessions`. |
+| `HOME`, `TERM` | _(from env)_ | Read for home-dir resolution (logs/registry) and terminal sizing/setup. |
+
 ## Sessions — launch a pre-configured agent run from a file or URL
 
 Instead of typing the system prompt and launching the agent by hand, hand
@@ -79,6 +109,19 @@ that is the whole handoff:
 }
 ```
 
+Every field is optional (an empty `{}` parses into an inert-but-valid manifest):
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | `""` | Human-readable label, shown on the session card. |
+| `system_prompt` | string | `""` | The session policy. Drives auto-accept on/off and is what the Haiku broker grades prompts against. |
+| `instructions` | string | `""` | The task handed to the agent — via its native prompt flag where known (`claude "<task>"`, `codex exec "<task>"`), else typed in once the agent's input settles. |
+| `backend` | string | `"mock"` | LLM-fallback backend: `"mock"` or `"anthropic"`. |
+| `auto_approve` | bool | `false` | Blind-approve **every** prompt with no policy grading (implies auto-accept). The same rubber stamp as `MT_AUTO_APPROVE`; disclosed loudly on the card. |
+| `cwd` | string | _(none)_ | Directory to `cd` into before setup/run. |
+| `setup` | string[] | `[]` | Commands run in capture mode (output shown) before `run`. |
+| `run` | string | _(none)_ | The command to launch after setup. If absent, the session drops straight into the interactive REPL. |
+
 Open it:
 
 ```bash
@@ -88,8 +131,8 @@ mock-terminal open examples/session.json     # or:  open https://…/session.jso
 It prints a **session card** showing exactly what will run. A **local** manifest
 you opened directly runs straight away (you chose the file); a manifest fetched
 from a **URL** requires a `[Y/n]` confirmation first — that's the remote-exec
-safety gate. Use `--yes` to skip the prompt or `--confirm` to force it for any
-source. Then the `system_prompt` becomes the session policy (so auto-accept +
+safety gate. Use `--yes` (`-y`) to skip the prompt or `--confirm` to force it for
+any source. Then the `system_prompt` becomes the session policy (so auto-accept +
 the Haiku broker engage as in interactive mode), it `cd`s into `cwd`, runs
 `setup`, and launches `run` with `instructions` delivered to the agent — via its
 native prompt flag where known (`claude "<task>"`, `codex exec "<task>"`) or
@@ -132,33 +175,38 @@ old-window               dead     12233    2h        launched
 
 Each session is the authoritative source of its own record (status, pid, last
 event). `ps` reconciles those records against live PIDs, so a window you closed
-or a crashed run shows as `dead` rather than lingering as `running`.
+or a crashed run shows as `dead` rather than lingering as `running`. Records
+older than 24h are pruned.
 
 ## How it works
 
 A persistent `bash` runs inside a PTY. Each captured command is wrapped with
 unique start/end markers and `</dev/null` so stdin-readers can't hang; output
 between the markers is the result, and the trailing marker carries the exit
-code.
+code. A captured command that runs past `MT_TIMEOUT_SECS` (default 30s) is
+interrupted and its process tree SIGKILLed.
 
 For interactive programs the terminal flips into **passthrough**: it resizes the
 inner PTY to your terminal, launches the program bare so it inherits the PTY as
 its controlling terminal, and shuttles raw bytes both ways until the program's
 process tree exits. Auto-accept watches the output stream for prompt patterns
-(`Do you want…`, `❯ 1. Yes`, `(y/n)`, …); once a prompt has settled it asks the
-policy broker (`src/decider.rs`) what to do. The broker sends your system prompt
-plus the scraped prompt text to a Haiku model and parses a one-token verdict
-(APPROVE / DENY / ESCALATE), so permission prompts are answered according to
-your policy rather than blindly accepted — and anything the policy doesn't
-clearly allow is escalated back to you instead of approved.
+(`Do you want…`, `❯ 1. Yes`, `(y/n)`, …) — first stripping ANSI escapes and
+scanning the visible tail, so prompts painted by a full-screen TUI are caught
+too. Once a prompt has settled it asks the policy broker (`src/decider.rs`) what
+to do. The broker sends your system prompt plus the scraped prompt text to a
+Haiku model and parses a one-token verdict (APPROVE / DENY / ESCALATE), so
+permission prompts are answered according to your policy rather than blindly
+accepted — and anything the policy doesn't clearly allow is escalated back to
+you instead of approved.
 
 ## Tests
 
 ```bash
-cargo test          # 75 unit + PTY integration tests
+cargo test                 # 79 unit + PTY integration tests
 expect tests/smoke.exp     # end-to-end: shell, interrupt, passthrough, auto-accept
 expect tests/manifest.exp  # end-to-end: `open` renders card, confirms, runs
 expect tests/ps.exp        # end-to-end: `ps` tracks a session running → done
+expect tests/anthropic.exp # end-to-end: live Anthropic fallback (needs ANTHROPIC_API_KEY)
 ```
 
 ## Built with Claude Code
