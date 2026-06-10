@@ -46,6 +46,11 @@ pub struct Manifest {
     /// The command to launch after setup (interactive or captured). `None` when
     /// absent, in which case the session goes straight to the interactive REPL.
     pub run: Option<String>,
+    /// Auto-advance: after the initial `instructions` are delivered, how many
+    /// follow-up continuation prompts to auto-type each time the agent goes idle
+    /// at its input box (finished a turn, no permission prompt up). 0 disables
+    /// it (default). Lets an agent keep progressing toward the task hands-free.
+    pub auto_advance: usize,
 }
 
 impl Manifest {
@@ -100,6 +105,23 @@ impl Manifest {
             Some(_) => return Err("field `auto_approve` must be a boolean".into()),
         };
 
+        // auto_advance: a non-negative count of follow-up nudges. Reject
+        // negatives / non-integers / absurdly large values rather than coerce.
+        let auto_advance = match obj.get("auto_advance") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(serde_json::Value::Number(n)) => match n.as_u64() {
+                Some(v) if v <= MAX_AUTO_ADVANCE as u64 => v as usize,
+                Some(_) => {
+                    return Err(format!(
+                        "field `auto_advance` must be between 0 and {MAX_AUTO_ADVANCE}"
+                    )
+                    .into())
+                }
+                None => return Err("field `auto_advance` must be a non-negative integer".into()),
+            },
+            Some(_) => return Err("field `auto_advance` must be a non-negative integer".into()),
+        };
+
         let setup = match obj.get("setup") {
             None | Some(serde_json::Value::Null) => Vec::new(),
             Some(serde_json::Value::Array(items)) => items
@@ -129,8 +151,57 @@ impl Manifest {
             cwd,
             setup,
             run,
+            auto_advance,
         })
     }
+}
+
+/// Upper bound on `auto_advance` — a sanity cap so a typo can't drive an agent
+/// indefinitely. Generous; real use is a handful of nudges.
+pub const MAX_AUTO_ADVANCE: usize = 50;
+
+/// Build up to `max` follow-up continuation prompts from the session's
+/// `instructions`, typed one at a time each time the agent goes idle (see
+/// `Shell::run_interactive`). The wording nudges the agent to keep progressing
+/// and to wind down cleanly (run validation / summarize) rather than spin
+/// forever — the count is the hard stop, this is the soft one.
+///
+/// Kept deterministic (no LLM) so unattended runs need no extra API calls and
+/// the behaviour is predictable. The original task is echoed once for context.
+pub fn advance_followups(instructions: &str, max: usize) -> Vec<String> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let task = instructions.trim();
+    let mut ladder: Vec<String> = Vec::new();
+    ladder.push(
+        "Continue working toward the task. If a step is ambiguous, pick the most reasonable \
+         option and proceed rather than stopping to ask."
+            .to_string(),
+    );
+    if !task.is_empty() {
+        ladder.push(format!(
+            "Keep going. For reference, the original task is: {task}"
+        ));
+    }
+    ladder.push(
+        "Review what you've done so far, fix anything incomplete or broken, and continue."
+            .to_string(),
+    );
+    ladder.push(
+        "If the task is complete, run any available tests or validation and report the result. \
+         If it isn't, keep going."
+            .to_string(),
+    );
+    // Pad with a steady, wind-down-friendly nudge if more advances are allowed
+    // than the bespoke ladder has rungs.
+    let steady = "Continue toward completing the task. If everything is done and verified, \
+                  summarize what you changed and stop.";
+    while ladder.len() < max {
+        ladder.push(steady.to_string());
+    }
+    ladder.truncate(max);
+    ladder
 }
 
 /// Build the command that launches `agent` with `task` delivered. Preferred path
@@ -177,10 +248,11 @@ fn shell_single_quote(s: &str) -> String {
 /// without showing this and getting confirmation. Kept pure (manifest in, string
 /// out) so it can be unit-tested without a terminal.
 ///
-/// `auto_accept` is passed in (rather than recomputed here) so the card always
-/// shows the exact value the session will use, derived once from the system
-/// prompt by the caller.
-pub fn render_card(m: &Manifest, auto_accept: bool) -> String {
+/// `auto_accept` and `auto_advance` are passed in (rather than read off `m`) so
+/// the card always shows the exact values the session will use — both are
+/// resolved once by the caller (auto-accept from the system prompt; auto-advance
+/// from the manifest field after any `MT_AUTO_ADVANCE` override).
+pub fn render_card(m: &Manifest, auto_accept: bool, auto_advance: usize) -> String {
     let mut s = String::new();
     s.push_str("════════════════════════════════════════════════════════════════\n");
     s.push_str(" SESSION TO LAUNCH — review before confirming\n");
@@ -238,6 +310,16 @@ pub fn render_card(m: &Manifest, auto_accept: bool) -> String {
     match &m.run {
         Some(run) => s.push_str(&format!(" run:         $ {}\n", sanitize_line(run))),
         None => s.push_str(" run:         (none — drops straight into the prompt)\n"),
+    }
+
+    // Auto-advance is consequential (the agent gets nudged forward unattended),
+    // so disclose the count on the card the user reviews. The caller passes the
+    // *resolved* count (manifest field after any MT_AUTO_ADVANCE override) so the
+    // card reflects what will actually happen.
+    if auto_advance > 0 {
+        s.push_str(&format!(
+            " auto-advance: ON — up to {auto_advance} follow-up prompt(s) auto-typed when idle\n"
+        ));
     }
 
     s.push_str("════════════════════════════════════════════════════════════════\n");
@@ -332,6 +414,67 @@ mod tests {
     }
 
     #[test]
+    fn auto_advance_parses_and_defaults() {
+        assert_eq!(Manifest::from_json("{}").unwrap().auto_advance, 0);
+        assert_eq!(
+            Manifest::from_json(r#"{"auto_advance": 3}"#).unwrap().auto_advance,
+            3
+        );
+        assert_eq!(
+            Manifest::from_json(r#"{"auto_advance": null}"#).unwrap().auto_advance,
+            0
+        );
+    }
+
+    #[test]
+    fn auto_advance_rejects_bad_values() {
+        assert!(Manifest::from_json(r#"{"auto_advance": -1}"#).is_err());
+        assert!(Manifest::from_json(r#"{"auto_advance": "3"}"#).is_err());
+        assert!(Manifest::from_json(r#"{"auto_advance": 1.5}"#).is_err());
+        assert!(Manifest::from_json(r#"{"auto_advance": 9999}"#).is_err());
+    }
+
+    #[test]
+    fn advance_followups_count_and_content() {
+        assert!(advance_followups("do the thing", 0).is_empty());
+
+        let three = advance_followups("fix the flaky test", 3);
+        assert_eq!(three.len(), 3);
+        // The original task is echoed once for context.
+        assert!(
+            three.iter().any(|f| f.contains("fix the flaky test")),
+            "task not echoed: {three:?}"
+        );
+
+        // More advances than bespoke rungs -> padded, never short, capped at max.
+        let many = advance_followups("task", 20);
+        assert_eq!(many.len(), 20);
+        assert!(many.last().unwrap().contains("summarize"));
+
+        // No task -> rungs still generated, none echo an (empty) task line.
+        let no_task = advance_followups("", 2);
+        assert_eq!(no_task.len(), 2);
+        assert!(!no_task.iter().any(|f| f.contains("original task is:")));
+    }
+
+    #[test]
+    fn card_discloses_auto_advance() {
+        let m = Manifest::from_json(r#"{"name": "x", "auto_advance": 4}"#).unwrap();
+        let card = render_card(&m, false, m.auto_advance);
+        assert!(card.contains("auto-advance: ON"), "card: {card}");
+        assert!(card.contains("up to 4"), "card: {card}");
+
+        // The card reflects the RESOLVED count passed in (e.g. an env override),
+        // not the raw manifest field — guards against the disclosure desyncing.
+        let overridden = render_card(&m, false, 9);
+        assert!(overridden.contains("up to 9"), "card: {overridden}");
+
+        // Off by default -> no auto-advance line.
+        let off = Manifest::from_json(r#"{"name": "y"}"#).unwrap();
+        assert!(!render_card(&off, false, 0).contains("auto-advance: ON"));
+    }
+
+    #[test]
     fn is_confirmed_accepts_yes_and_empty() {
         assert!(is_confirmed("y"));
         assert!(is_confirmed("yes"));
@@ -364,7 +507,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let card = render_card(&m, true);
+        let card = render_card(&m, true, m.auto_advance);
         assert!(card.contains("accept reads and tests"), "policy: {card}");
         assert!(card.contains("mock"), "backend: {card}");
         assert!(card.contains("echo running-task"), "run: {card}");
@@ -375,7 +518,7 @@ mod tests {
     #[test]
     fn render_card_shows_setup_and_no_run() {
         let m = Manifest::from_json(r#"{"setup": ["echo a", "echo b"]}"#).unwrap();
-        let card = render_card(&m, false);
+        let card = render_card(&m, false, m.auto_advance);
         assert!(card.contains("echo a"), "{card}");
         assert!(card.contains("echo b"), "{card}");
         // With no run command the card says so, and auto-accept reads off.
@@ -402,7 +545,7 @@ mod tests {
             "{\"name\":\"ok\\u001b[2Khidden\\rXX\",\"run\":\"echo a\\u001b[1A\\rrm -rf /\"}",
         )
         .unwrap();
-        let card = render_card(&m, false);
+        let card = render_card(&m, false, m.auto_advance);
         assert!(!card.contains('\x1b'), "ESC must be stripped: {card:?}");
         assert!(!card.contains('\r'), "CR must be stripped: {card:?}");
     }
@@ -416,7 +559,7 @@ mod tests {
         assert!(Manifest::from_json(r#"{"auto_approve": "yes"}"#).is_err());
         // The card must loudly disclose the blind rubber stamp.
         let m = Manifest::from_json(r#"{"auto_approve": true}"#).unwrap();
-        let card = render_card(&m, true);
+        let card = render_card(&m, true, m.auto_advance);
         assert!(card.contains("BLIND"), "card must disclose blind approve: {card}");
     }
 

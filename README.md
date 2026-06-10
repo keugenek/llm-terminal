@@ -23,10 +23,25 @@ $ claude                  # interactive agent → full passthrough TUI
 - **LLM fallback.** If a command isn't found (exit 127), the input is sent to a
   backend (mock for testing, or the Anthropic Messages API) and the reply is
   printed inline.
+- **Tab completion.** The prompt's line editor completes the word under the
+  cursor on Tab: in command position it matches REPL built-ins (`/exit`,
+  `/quit`), known interactive tools, and `$PATH` executables; elsewhere it
+  completes filesystem paths (descends into directories, `~` expands). A unique
+  match fills in; an ambiguous one extends to the common prefix, and a second
+  Tab lists the candidates.
 - **Interactive passthrough.** Full-screen / REPL programs (`claude`, `vim`,
   `top`, `python`, …) get handed the raw terminal — arrows, escapes, Ctrl-keys
   all pass through. Prefix any command with `:` to force it, or add names via
   `MT_INTERACTIVE`.
+- **Auto-advance (hands-free task progress).** For an unattended agent run,
+  after the initial task is delivered the terminal watches for the agent to
+  finish a turn and go idle at its input box (no output, no permission prompt
+  up), then auto-types the next *continuation prompt* to keep it moving toward
+  the goal. Follow-ups are derived from the session's `instructions` (a
+  deterministic nudge ladder — no extra LLM calls) and bounded by a count, so
+  it advances toward completion and winds down rather than spinning forever.
+  Enable per-session with the manifest's `auto_advance` field (or
+  `MT_AUTO_ADVANCE`).
 - **Auto-accept with a model-graded policy broker.** Opt in via the startup
   system prompt (type something with "accept"). Known agents launch with their
   native permission-bypass flag; for everything else, when a prompt settles a
@@ -84,6 +99,8 @@ file.
 | `ANTHROPIC_API_KEY` | _(unset)_ | API key for the `anthropic` fallback backend **and** the Haiku policy broker. Without it, auto-accept falls back to blind always-approve. |
 | `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Model for the `anthropic` fallback backend. The policy broker always grades with Haiku regardless of this. |
 | `MT_AUTO_APPROVE` | _(unset)_ | If set to **any** value, blind-approve every prompt with no policy grading (rubber stamp). Presence-only — the value is ignored. |
+| `MT_AUTO_ADVANCE` | _(manifest)_ | Overrides the manifest's `auto_advance` count: how many follow-up prompts to auto-type when the agent goes idle. Clamped to 50. |
+| `MT_AUTO_ADVANCE_IDLE_MS` | `8000` | How long (ms) the agent must be idle at its input before an auto-advance follow-up fires. |
 | `MT_INTERACTIVE` | _(empty)_ | Extra command names (comma/space-separated) to always treat as interactive passthrough, on top of the built-in list. |
 | `MT_TIMEOUT_SECS` | `30` | Timeout in seconds for a captured (non-interactive) command before it's interrupted. |
 | `MT_TRAJECTORY_DIR` | `~/.til/trajectories` | Directory for per-session trajectory JSONL logs (files land directly under it). |
@@ -121,6 +138,7 @@ Every field is optional (an empty `{}` parses into an inert-but-valid manifest):
 | `cwd` | string | _(none)_ | Directory to `cd` into before setup/run. |
 | `setup` | string[] | `[]` | Commands run in capture mode (output shown) before `run`. |
 | `run` | string | _(none)_ | The command to launch after setup. If absent, the session drops straight into the interactive REPL. |
+| `auto_advance` | int | `0` | How many follow-up continuation prompts to auto-type when the agent finishes a turn and goes idle (hands-free progress toward the task). 0 disables it; max 50. Disclosed on the card. |
 
 Open it:
 
@@ -202,9 +220,11 @@ you instead of approved.
 ## Tests
 
 ```bash
-cargo test                 # 79 unit + PTY integration tests
+cargo test                 # 94 unit + PTY integration tests
 expect tests/smoke.exp     # end-to-end: shell, interrupt, passthrough, auto-accept
+expect tests/complete.exp  # end-to-end: Tab completion (command + path)
 expect tests/manifest.exp  # end-to-end: `open` renders card, confirms, runs
+expect tests/advance.exp   # end-to-end: auto-advance types follow-ups when idle
 expect tests/ps.exp        # end-to-end: `ps` tracks a session running → done
 expect tests/anthropic.exp # end-to-end: live Anthropic fallback (needs ANTHROPIC_API_KEY)
 ```

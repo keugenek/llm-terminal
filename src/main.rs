@@ -1,4 +1,5 @@
 mod backend;
+mod complete;
 mod decider;
 mod manifest;
 mod registry;
@@ -14,7 +15,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use shell::Shell;
 use std::io::{stdout, BufRead, Write};
@@ -87,9 +88,13 @@ fn run_manifest(
     // approve prompts without auto-accept being on).
     let auto_accept = wants_auto_accept(&m.system_prompt) || m.auto_approve;
 
+    // Resolve the auto-advance count once (manifest field + MT_AUTO_ADVANCE
+    // override) so the card and the run agree on the effective value.
+    let advance_count = resolve_auto_advance(m.auto_advance);
+
     // Always show the card (so there's a record of what's about to run); only
     // block for confirmation when required (URL source, or --confirm).
-    print!("{}", manifest::render_card(&m, auto_accept));
+    print!("{}", manifest::render_card(&m, auto_accept, advance_count));
     std::io::stdout().flush()?;
     if confirmation_required(is_url, force_yes, force_confirm) {
         // Never auto-confirm a non-interactive stdin. At EOF (piped, `</dev/null`,
@@ -175,15 +180,23 @@ fn run_manifest(
             };
             let pending = inject.then_some(m.instructions.as_str());
 
+            // Auto-advance follow-ups built from the resolved count (computed
+            // above, shared with the card). Empty when disabled — run_interactive
+            // then behaves as before. Derived from the task so nudges stay on-topic.
+            let followups = manifest::advance_followups(&m.instructions, advance_count);
+
             if let Some(cmd) = interactive_command(&launch_cmd) {
                 trajectory.log_interactive(cmd);
                 shell.run_interactive(
                     cmd,
-                    auto_accept,
-                    &*decider,
-                    &m.system_prompt,
+                    shell::InteractiveDriver {
+                        auto_accept,
+                        decider: &*decider,
+                        policy: &m.system_prompt,
+                        pending_input: pending,
+                        advance_followups: &followups,
+                    },
                     &trajectory,
-                    pending,
                 )?;
             } else {
                 let mut never = || false;
@@ -306,6 +319,17 @@ fn build_decider(auto_accept: bool, blind: bool) -> Box<dyn Decider> {
 /// session) a manifest's `auto_approve` field.
 fn blind_approve_requested(manifest_auto_approve: bool) -> bool {
     manifest_auto_approve || std::env::var_os("MT_AUTO_APPROVE").is_some()
+}
+
+/// Resolve the auto-advance count: `MT_AUTO_ADVANCE` env overrides the manifest
+/// value when set to a valid count, else the manifest's `auto_advance`. Both are
+/// clamped to `MAX_AUTO_ADVANCE`.
+fn resolve_auto_advance(manifest_count: usize) -> usize {
+    let count = match std::env::var("MT_AUTO_ADVANCE") {
+        Ok(s) => s.trim().parse::<usize>().unwrap_or(manifest_count),
+        Err(_) => manifest_count,
+    };
+    count.min(manifest::MAX_AUTO_ADVANCE)
 }
 
 fn run_interactive_session(backend_kind: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -493,7 +517,7 @@ fn repl(
         execute!(out, SetForegroundColor(Color::Cyan), Print("$ "), ResetColor)?;
         out.flush()?;
 
-        let line = match read_line(&mut out)? {
+        let line = match read_line(&mut out, "$ ")? {
             Some(l) => l,
             None => {
                 execute!(out, Print("\r\n"))?;
@@ -515,7 +539,18 @@ fn repl(
         // the policy the broker grades each settled prompt against.
         if let Some(cmd) = interactive_command(trimmed) {
             trajectory.log_interactive(cmd);
-            shell.run_interactive(cmd, auto_accept, decider, system, trajectory, None)?;
+            // Plain interactive launches carry no task, so no auto-advance.
+            shell.run_interactive(
+                cmd,
+                shell::InteractiveDriver {
+                    auto_accept,
+                    decider,
+                    policy: system,
+                    pending_input: None,
+                    advance_followups: &[],
+                },
+                trajectory,
+            )?;
             continue;
         }
 
@@ -550,7 +585,13 @@ fn repl(
     Ok(())
 }
 
-fn read_line(out: &mut impl Write) -> Result<Option<String>, Box<dyn std::error::Error>> {
+/// Read one line in raw mode with simple editing + Tab completion. `prompt` is
+/// the visible prompt text the caller already printed; it's reprinted (plain)
+/// only when a Tab candidate listing forces a redraw onto a fresh line.
+fn read_line(
+    out: &mut impl Write,
+    prompt: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut buf = String::new();
     loop {
         let ev = event::read()?;
@@ -560,6 +601,9 @@ fn read_line(out: &mut impl Write) -> Result<Option<String>, Box<dyn std::error:
             }
             match k.code {
                 KeyCode::Enter => return Ok(Some(buf)),
+                KeyCode::Tab => {
+                    apply_completion(out, &mut buf, prompt)?;
+                }
                 KeyCode::Backspace => {
                     if buf.pop().is_some() {
                         execute!(out, cursor::MoveLeft(1), Print(' '), cursor::MoveLeft(1))?;
@@ -587,6 +631,93 @@ fn read_line(out: &mut impl Write) -> Result<Option<String>, Box<dyn std::error:
             }
         }
     }
+}
+
+/// Handle a Tab press: complete the final token in `buf`, updating both the
+/// buffer and the on-screen line. On an ambiguous match we extend to the common
+/// prefix; a second Tab (no further extension possible) lists the candidates on
+/// a fresh line and reprints `prompt` + `buf`.
+fn apply_completion(
+    out: &mut impl Write,
+    buf: &mut String,
+    prompt: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match complete::complete(buf) {
+        complete::Completion::None => {}
+        complete::Completion::Replace { token, completed } => {
+            let new_buf = replace_final_token(buf, &token, &completed);
+            redraw_input(out, buf, &new_buf)?;
+            *buf = new_buf;
+        }
+        complete::Completion::Candidates {
+            token,
+            common,
+            list,
+        } => {
+            if common.len() > token.len() {
+                // Extend the typed token to the common prefix.
+                let new_buf = replace_final_token(buf, &token, &common);
+                redraw_input(out, buf, &new_buf)?;
+                *buf = new_buf;
+            } else {
+                // Already at the common prefix: show the candidates, then
+                // restore the input line so editing continues seamlessly.
+                list_candidates(out, &list)?;
+                execute!(out, Print(prompt), Print(buf.as_str()))?;
+                out.flush()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace the final token (a suffix of `buf`, possibly empty) with `completed`.
+fn replace_final_token(buf: &str, token: &str, completed: &str) -> String {
+    let head = buf.strip_suffix(token).unwrap_or(buf);
+    format!("{head}{completed}")
+}
+
+/// Rewrite the visible input from `old` to `new`: walk the cursor back over
+/// `old`, clear to end of line, print `new`.
+///
+/// Assumes one terminal column per char and no line wrap (same assumption the
+/// Backspace handler makes). This is correct for ASCII and stays on a single
+/// row; it can mis-render if the completed token contains wide chars (CJK/emoji)
+/// or pushes the line past the terminal width. We deliberately do NOT query the
+/// cursor (`cursor::position()`) to anchor an absolute redraw here: that query
+/// emits ESC[6n and consumes input events during its round-trip, which races
+/// with fast typing/paste at the prompt (it broke interactive passthrough in
+/// testing). The mis-render is cosmetic — `buf` stays correct and the screen
+/// self-heals on the next full reprint (Enter, or a candidate listing).
+fn redraw_input(
+    out: &mut impl Write,
+    old: &str,
+    new: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let old_cols = old.chars().count() as u16;
+    if old_cols > 0 {
+        execute!(out, cursor::MoveLeft(old_cols))?;
+    }
+    execute!(out, Clear(ClearType::UntilNewLine), Print(new))?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Print a candidate listing on a fresh line, space-separated and capped so a
+/// broad prefix (e.g. all of `$PATH`) can't flood the screen.
+fn list_candidates(
+    out: &mut impl Write,
+    list: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX: usize = 60;
+    execute!(out, Print("\r\n"))?;
+    let shown = list.len().min(MAX);
+    execute!(out, Print(list[..shown].join("  ")))?;
+    if list.len() > MAX {
+        execute!(out, Print(format!("  … ({} more)", list.len() - MAX)))?;
+    }
+    execute!(out, Print("\r\n"))?;
+    Ok(())
 }
 
 fn print_block(out: &mut impl Write, text: &str) -> Result<(), Box<dyn std::error::Error>> {

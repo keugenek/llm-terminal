@@ -1,0 +1,49 @@
+#!/usr/bin/env expect
+# End-to-end for Tab completion in the REPL line editor:
+#   - a unique slash-command prefix completes (/ex -> /exit) and runs
+#   - a unique path prefix completes to the full filename
+set timeout 15
+log_user 0
+
+# --- command completion: "/ex" + Tab -> "/exit ", which then exits ---
+spawn ./target/debug/mock-terminal
+expect "system prompt>"
+send "\r"
+expect "$ "
+# Type a unique builtin prefix and press Tab.
+send "/ex\t"
+expect {
+    "/exit" { puts "PASS: command Tab-completed /ex -> /exit" }
+    timeout { puts "FAIL: /ex did not complete"; exit 1 }
+}
+# The completion left "/exit " in the buffer; Enter runs it (trimmed) -> quit.
+send "\r"
+expect {
+    eof { puts "PASS: completed /exit command executed (clean exit)" }
+    timeout { puts "FAIL: /exit did not run"; exit 1 }
+}
+
+# --- path completion: unique file prefix completes to the full name ---
+set dir /tmp/mt-complete-e2e
+exec rm -rf $dir
+exec mkdir -p $dir
+exec sh -c "echo x > $dir/uniquefile.txt"
+
+spawn ./target/debug/mock-terminal
+expect "system prompt>"
+send "\r"
+expect "$ "
+# Path token after a command -> path mode. Unique prefix -> full completion.
+send "ls $dir/uniq\t"
+expect {
+    "uniquefile.txt" { puts "PASS: path Tab-completed uniq -> uniquefile.txt" }
+    timeout { puts "FAIL: path did not complete"; exit 1 }
+}
+# Abort the line with Ctrl-C (exits the prompt) rather than running ls.
+send "\x03"
+expect {
+    eof { puts "PASS: Ctrl-C exited after path completion" }
+    timeout { puts "FAIL: did not exit"; exit 1 }
+}
+exec rm -rf $dir
+puts "PASS: completion e2e done"

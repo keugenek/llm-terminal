@@ -1,0 +1,9 @@
+{
+  "name": "auto-advance — keep the agent moving",
+  "system_prompt": "auto-approve reads, edits, and tests; escalate anything that deletes or spends",
+  "instructions": "Implement the feature described in TASK.md, then run the test suite until it is green.",
+  "backend": "anthropic",
+  "cwd": "/path/to/repo",
+  "run": "claude",
+  "auto_advance": 5
+}

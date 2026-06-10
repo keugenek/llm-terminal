@@ -34,6 +34,31 @@ const AUTO_ACCEPT_DENY_FOLLOWUP: Duration = Duration::from_millis(500);
 // Longer than IDLE so the agent's startup banner/TUI has fully settled first.
 const AUTO_ACCEPT_TASK_DELAY: Duration = Duration::from_millis(1500);
 
+// Auto-advance tuning. After the initial task is delivered, when the agent has
+// finished a turn and is idle at its input box (no output, no permission prompt
+// up), we type the next follow-up. IDLE is deliberately long so we only fire on
+// a genuine end-of-turn, not a mid-work pause; COOLDOWN bounds the rate.
+const AUTO_ADVANCE_IDLE: Duration = Duration::from_secs(8);
+const AUTO_ADVANCE_COOLDOWN: Duration = Duration::from_secs(4);
+
+/// How to drive an interactive (pty-passthrough) program: the auto-accept policy
+/// plus unattended task delivery and advancement. Bundled into one argument so
+/// `run_interactive` stays readable; see its docs for per-field semantics.
+pub struct InteractiveDriver<'a> {
+    /// When set, answer permission prompts (native bypass flag + broker).
+    pub auto_accept: bool,
+    /// Grades each settled prompt when the broker runs.
+    pub decider: &'a dyn Decider,
+    /// The system prompt — the policy the broker grades prompts against.
+    pub policy: &'a str,
+    /// Task typed once after the program's first output burst settles (seeds an
+    /// agent that takes its prompt interactively rather than from argv).
+    pub pending_input: Option<&'a str>,
+    /// Auto-advance continuation prompts, typed one per end-of-turn idle. Empty
+    /// disables auto-advance.
+    pub advance_followups: &'a [String],
+}
+
 pub struct Shell {
     writer: Box<dyn Write + Send>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -251,16 +276,28 @@ impl Shell {
     /// is how unattended task delivery seeds an agent that takes its prompt
     /// interactively rather than from argv. It fires regardless of `auto_accept`.
     ///
+    /// `advance_followups` are auto-advance continuation prompts: after the
+    /// initial task is delivered, each time the agent finishes a turn and goes
+    /// idle at its input box (no output for a while, no permission prompt up),
+    /// the next follow-up is typed in. Empty disables auto-advance (the default
+    /// for plain interactive sessions). Independent of `auto_accept`, but in
+    /// practice paired with it for hands-free runs.
+    ///
     /// The outer terminal must already be in raw mode.
     pub fn run_interactive(
         &mut self,
         command: &str,
-        auto_accept: bool,
-        decider: &dyn Decider,
-        policy: &str,
+        driver: InteractiveDriver<'_>,
         trajectory: &Trajectory,
-        pending_input: Option<&str>,
     ) -> Result<(), Box<dyn Error>> {
+        // Unpack the driver into the locals the rest of the body uses.
+        let InteractiveDriver {
+            auto_accept,
+            decider,
+            policy,
+            pending_input,
+            advance_followups,
+        } = driver;
         // When auto-accept is on, prefer a known agent's native permission-bypass
         // flag (claude --dangerously-skip-permissions). Whether the output-scanning
         // broker ALSO runs depends on the decider — see `broker_should_run`:
@@ -329,8 +366,22 @@ impl Shell {
         // don't type into a program that hasn't drawn its input line. (A plain
         // `last_output > start` is always true since last_output starts later.)
         let mut saw_output = false;
-        // Track output for idle detection whenever either path needs it.
-        let track_output = broker_active || pending_input.is_some();
+        // Auto-advance state: which follow-up to type next, and when we last
+        // advanced (for the inter-nudge cooldown). The idle window is overridable
+        // via MT_AUTO_ADVANCE_IDLE_MS (tests use a small value; default 8s).
+        let advance_enabled = !advance_followups.is_empty();
+        let mut advance_idx: usize = 0;
+        let mut last_advance = start;
+        let advance_idle = std::env::var("MT_AUTO_ADVANCE_IDLE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(AUTO_ADVANCE_IDLE);
+        // Scanning (rolling tail + prompt detection) is needed by the broker AND
+        // by auto-advance, which must NOT nudge while a permission prompt is up.
+        let scan_active = broker_active || advance_enabled;
+        // Track output for idle detection whenever any path needs it.
+        let track_output = scan_active || pending_input.is_some();
         loop {
             // Inner pty -> screen.
             let mut wrote = false;
@@ -340,7 +391,7 @@ impl Shell {
                     last_output = Instant::now();
                     saw_output = true;
                 }
-                if broker_active {
+                if scan_active {
                     tail.extend_from_slice(&chunk);
                     let overflow = tail.len().saturating_sub(AUTO_ACCEPT_TAIL);
                     if overflow > 0 {
@@ -364,6 +415,10 @@ impl Shell {
                     self.writer.flush()?;
                     trajectory.log_interactive(&format!("task-injected: {task}"));
                     pending_input = None;
+                    // Start the auto-advance idle clock from AFTER the task is
+                    // typed, not from the pre-task settle, so the first nudge
+                    // waits for the agent's first turn rather than firing early.
+                    last_output = Instant::now();
                 }
             }
 
@@ -372,8 +427,11 @@ impl Shell {
             // goes idle after the prompt, OR — for animated TUIs that never go
             // idle (Claude Code redraws a spinner, hints, cursor) — once the
             // prompt has been on screen long enough to have finished rendering.
+            // Prompt detection feeds both the broker (which prompt to answer)
+            // and auto-advance (which must hold off while a prompt is up).
+            let is_prompt = scan_active && looks_like_prompt(&String::from_utf8_lossy(&tail));
+
             if broker_active {
-                let is_prompt = looks_like_prompt(&String::from_utf8_lossy(&tail));
                 if is_prompt {
                     prompt_seen_at.get_or_insert_with(Instant::now);
                 } else {
@@ -462,6 +520,48 @@ impl Shell {
                         }
                     }
                 }
+            }
+
+            // Auto-advance: the agent has finished a turn and is idle at its
+            // input box (initial task delivered, no recent output, no permission
+            // prompt up). Type the next follow-up to keep it moving toward the
+            // task. The IDLE window keeps this off during active work; the count
+            // and per-nudge cooldown bound how far it can run.
+            // The FIRST nudge waits twice as long. For agents seeded via argv
+            // (claude/codex — no pending_input to gate on), this avoids
+            // interrupting a slow first turn / cold start that briefly goes quiet
+            // before producing tokens. Later nudges follow a genuine end-of-turn,
+            // so the normal idle window applies.
+            let needed_idle = if advance_idx == 0 {
+                advance_idle.saturating_mul(2)
+            } else {
+                advance_idle
+            };
+            if advance_enabled
+                && advance_idx < advance_followups.len()
+                && pending_input.is_none()
+                && saw_output
+                && !is_prompt
+                && last_output.elapsed() > needed_idle
+                && last_advance.elapsed() > AUTO_ADVANCE_COOLDOWN
+                && last_inject.elapsed() > AUTO_ADVANCE_COOLDOWN
+            {
+                let followup = &advance_followups[advance_idx];
+                self.writer.write_all(followup.as_bytes())?;
+                self.writer.write_all(b"\r")?;
+                self.writer.flush()?;
+                trajectory.log_interactive(&format!(
+                    "auto-advance {}/{}: {followup}",
+                    advance_idx + 1,
+                    advance_followups.len()
+                ));
+                advance_idx += 1;
+                last_advance = Instant::now();
+                // Reset idle + prompt-detection state so the next nudge waits for
+                // a fresh end-of-turn rather than firing again immediately.
+                last_output = Instant::now();
+                tail.clear();
+                prompt_seen_at = None;
             }
 
             // Keyboard -> inner pty (raw bytes: arrows, escapes, Ctrl-* all pass).

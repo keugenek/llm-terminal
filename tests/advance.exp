@@ -1,0 +1,58 @@
+#!/usr/bin/env expect
+# End-to-end for auto-advance: a manifest with `auto_advance` set drives a fake
+# interactive agent. After the initial task is typed in, the agent goes idle and
+# the terminal auto-types a follow-up continuation prompt, which the agent reads.
+#
+# The fake agent echoes "GOT: <line>" for each line it reads, so we can see both
+# the initial task delivery and the auto-advance follow-up land.
+set timeout 25
+log_user 0
+
+# Short idle window so we don't wait the 8s default for the nudge.
+set env(MT_AUTO_ADVANCE_IDLE_MS) 1200
+set env(MT_TRAJECTORY_DIR) /tmp/til-advance-test
+
+# A fake interactive agent: print a non-prompt banner, then echo each input line.
+set agent /tmp/mt-fake-agent.sh
+set fh [open $agent w]
+puts $fh "#!/bin/bash"
+puts $fh "echo agent-ready"
+puts $fh "while IFS= read -r line; do echo \"GOT: \$line\"; done"
+close $fh
+exec chmod +x $agent
+
+# The agent's basename must be on the interactive list to get passthrough.
+set env(MT_INTERACTIVE) "mt-fake-agent.sh"
+
+# Manifest: deliver an initial task, then allow 2 auto-advance follow-ups.
+set f /tmp/mt-advance.json
+set fh [open $f w]
+puts $fh "{ \"name\": \"adv\", \"system_prompt\": \"accept\", \"instructions\": \"do the task\", \"run\": \"$agent\", \"auto_advance\": 2 }"
+close $fh
+
+spawn ./target/debug/mock-terminal open $f
+expect {
+    "SESSION TO LAUNCH" { puts "PASS: card rendered" }
+    timeout { puts "FAIL: no card"; exit 1 }
+}
+expect {
+    "auto-advance: ON" { puts "PASS: card discloses auto-advance" }
+    timeout { puts "FAIL: card missing auto-advance disclosure"; exit 1 }
+}
+# Initial task delivered via keystroke injection (unknown agent).
+expect {
+    "GOT: do the task" { puts "PASS: initial task delivered" }
+    timeout { puts "FAIL: initial task not delivered"; exit 1 }
+}
+# After idle, the first auto-advance follow-up is typed and echoed back.
+expect {
+    "GOT: Continue working toward the task" { puts "PASS: auto-advance follow-up typed" }
+    timeout { puts "FAIL: auto-advance did not fire"; exit 1 }
+}
+# Exit the passthrough (Ctrl-D closes the agent's stdin -> read loop ends).
+send "\x04"
+expect "$ "
+send "/exit\r"
+expect eof
+exec rm -f $agent $f
+puts "PASS: auto-advance e2e done"
