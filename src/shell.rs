@@ -41,6 +41,14 @@ const AUTO_ACCEPT_TASK_DELAY: Duration = Duration::from_millis(1500);
 const AUTO_ADVANCE_IDLE: Duration = Duration::from_secs(8);
 const AUTO_ADVANCE_COOLDOWN: Duration = Duration::from_secs(4);
 
+// After typing injected text (task or auto-advance follow-up) into an agent's
+// input box, wait this long, then send Enter as a SEPARATE keystroke. TUIs like
+// Claude Code (Ink/readline) coalesce `text\r` arriving in one read and treat
+// the trailing CR as part of a multi-line paste rather than a submit, so the
+// text just sits in the box. Serving the CR on its own — after the text has
+// rendered — submits it, mirroring how the broker injects a lone `\r`.
+const AUTO_SUBMIT_DELAY: Duration = Duration::from_millis(400);
+
 /// How to drive an interactive (pty-passthrough) program: the auto-accept policy
 /// plus unattended task delivery and advancement. Bundled into one argument so
 /// `run_interactive` stays readable; see its docs for per-field semantics.
@@ -362,6 +370,9 @@ impl Shell {
         // Task delivery for an agent that takes its prompt interactively: type
         // it once the program settles, then clear so we never type it twice.
         let mut pending_input = pending_input;
+        // When set, we typed text (task or follow-up) and owe it a separate Enter
+        // once this instant is `AUTO_SUBMIT_DELAY` old — see AUTO_SUBMIT_DELAY.
+        let mut pending_submit: Option<Instant> = None;
         // Did the program actually emit any output yet? Gates task delivery so we
         // don't type into a program that hasn't drawn its input line. (A plain
         // `last_output > start` is always true since last_output starts later.)
@@ -411,13 +422,23 @@ impl Shell {
             if let Some(task) = pending_input {
                 if saw_output && last_output.elapsed() > AUTO_ACCEPT_TASK_DELAY {
                     self.writer.write_all(task.as_bytes())?;
-                    self.writer.write_all(b"\r")?;
                     self.writer.flush()?;
                     trajectory.log_interactive(&format!("task-injected: {task}"));
                     pending_input = None;
-                    // Start the auto-advance idle clock from AFTER the task is
-                    // typed, not from the pre-task settle, so the first nudge
-                    // waits for the agent's first turn rather than firing early.
+                    // Owe a separate Enter (see pending_submit / AUTO_SUBMIT_DELAY).
+                    pending_submit = Some(Instant::now());
+                }
+            }
+
+            // Serve the deferred Enter for previously-typed text, on its own, once
+            // the text has had time to render into the input box.
+            if let Some(typed_at) = pending_submit {
+                if typed_at.elapsed() > AUTO_SUBMIT_DELAY {
+                    self.writer.write_all(b"\r")?;
+                    self.writer.flush()?;
+                    pending_submit = None;
+                    // Start the idle clock for the next nudge from AFTER the input
+                    // is actually submitted, so it waits for a real end-of-turn.
                     last_output = Instant::now();
                 }
             }
@@ -540,6 +561,7 @@ impl Shell {
             if advance_enabled
                 && advance_idx < advance_followups.len()
                 && pending_input.is_none()
+                && pending_submit.is_none()
                 && saw_output
                 && !is_prompt
                 && last_output.elapsed() > needed_idle
@@ -548,7 +570,6 @@ impl Shell {
             {
                 let followup = &advance_followups[advance_idx];
                 self.writer.write_all(followup.as_bytes())?;
-                self.writer.write_all(b"\r")?;
                 self.writer.flush()?;
                 trajectory.log_interactive(&format!(
                     "auto-advance {}/{}: {followup}",
@@ -557,6 +578,8 @@ impl Shell {
                 ));
                 advance_idx += 1;
                 last_advance = Instant::now();
+                // Owe a separate Enter to submit the follow-up (see pending_submit).
+                pending_submit = Some(Instant::now());
                 // Reset idle + prompt-detection state so the next nudge waits for
                 // a fresh end-of-turn rather than firing again immediately.
                 last_output = Instant::now();
