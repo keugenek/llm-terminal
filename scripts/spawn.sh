@@ -51,6 +51,11 @@ if [ -z "$BIN" ]; then
   else
     BIN="mock-terminal" # rely on $PATH
   fi
+elif [ -e "$BIN" ] && [[ "$BIN" != /* ]]; then
+  # A relative --bin resolves against OUR cwd, but the spawned shell starts
+  # in $HOME — where it would die with "command not found" before the
+  # session ever registers. Absolutize it here.
+  BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 fi
 
 # A local path is made absolute (the spawned shell starts in $HOME); a URL is
@@ -67,7 +72,18 @@ case "$SOURCE" in
     ;;
 esac
 
-RUN_CMD="$BIN open $ARG"
+# Forward MT_* tuning vars into the spawned window: osascript's "do script"
+# opens a fresh login shell that does NOT inherit this shell's environment,
+# so e.g. `MT_AUTO_ADVANCE_IDLE_MS=15000 spawn.sh …` would silently apply
+# only to the parent. Prefix the command with explicit assignments instead.
+ENV_PREFIX=""
+for var in MT_AUTO_ADVANCE MT_AUTO_ADVANCE_IDLE_MS MT_AUTO_APPROVE MT_INTERACTIVE MT_TIMEOUT_SECS MT_TRAJECTORY_DIR MT_TIL_DIR; do
+  if [ -n "${!var:-}" ]; then
+    ENV_PREFIX="${ENV_PREFIX}${var}='${!var}' "
+  fi
+done
+
+RUN_CMD="${ENV_PREFIX}$BIN open $ARG"
 TITLE="🤖 ${NAME}"
 
 # AppleScript: open a NEW WINDOW (default) or a TAB in the front window.

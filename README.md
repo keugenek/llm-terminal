@@ -40,8 +40,11 @@ $ claude                  # interactive agent → full passthrough TUI
   the goal. Follow-ups are derived from the session's `instructions` (a
   deterministic nudge ladder — no extra LLM calls) and bounded by a count, so
   it advances toward completion and winds down rather than spinning forever.
-  Enable per-session with the manifest's `auto_advance` field (or
-  `MT_AUTO_ADVANCE`).
+  A nudge typed into an agent that's quietly mid-work (a long silent tool
+  call looks identical to idle) only queues — so until the agent visibly
+  consumes it, each further nudge waits exponentially longer instead of
+  draining the ladder. Enable per-session with the manifest's `auto_advance`
+  field (or `MT_AUTO_ADVANCE`).
 - **Auto-accept with a model-graded policy broker.** Opt in via the startup
   system prompt (type something with "accept"). Known agents launch with their
   native permission-bypass flag; for everything else, when a prompt settles a
@@ -100,7 +103,7 @@ file.
 | `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Model for the `anthropic` fallback backend. The policy broker always grades with Haiku regardless of this. |
 | `MT_AUTO_APPROVE` | _(unset)_ | If set to **any** value, blind-approve every prompt with no policy grading (rubber stamp). Presence-only — the value is ignored. |
 | `MT_AUTO_ADVANCE` | _(manifest)_ | Overrides the manifest's `auto_advance` count: how many follow-up prompts to auto-type when the agent goes idle. Clamped to 50. |
-| `MT_AUTO_ADVANCE_IDLE_MS` | `8000` | How long (ms) the agent must be idle at its input before an auto-advance follow-up fires. |
+| `MT_AUTO_ADVANCE_IDLE_MS` | `8000` | How long (ms) the agent must be idle at its input before an auto-advance follow-up fires. While a follow-up sits unconsumed (no real output since it was typed — the agent is in a long silent tool call, not idle), the window for the next one doubles, up to 16×, so a quiet stretch can't drain the whole ladder. |
 | `MT_INTERACTIVE` | _(empty)_ | Extra command names (comma/space-separated) to always treat as interactive passthrough, on top of the built-in list. |
 | `MT_TIMEOUT_SECS` | `30` | Timeout in seconds for a captured (non-interactive) command before it's interrupted. |
 | `MT_TRAJECTORY_DIR` | `~/.til/trajectories` | Directory for per-session trajectory JSONL logs (files land directly under it). |

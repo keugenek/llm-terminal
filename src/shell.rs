@@ -40,6 +40,16 @@ const AUTO_ACCEPT_TASK_DELAY: Duration = Duration::from_millis(1500);
 // a genuine end-of-turn, not a mid-work pause; COOLDOWN bounds the rate.
 const AUTO_ADVANCE_IDLE: Duration = Duration::from_secs(8);
 const AUTO_ADVANCE_COOLDOWN: Duration = Duration::from_secs(4);
+// "No output" alone can't distinguish an idle input box from an agent deep in
+// a silent tool call (a long `sleep`-and-poll Bash command renders nothing for
+// minutes). A nudge typed into a busy agent only queues — and its keystroke
+// echo is the sole output it produces. So a nudge counts as CONSUMED only once
+// the agent has emitted at least this many bytes since it fired (a real turn
+// produces kilobytes; our own echo is a few hundred bytes). While a nudge sits
+// unconsumed, the idle window for the next one doubles, up to the cap — a
+// silent stretch costs a couple of nudges, not the whole ladder.
+const AUTO_ADVANCE_PROGRESS_BYTES: usize = 4096;
+const AUTO_ADVANCE_BACKOFF_CAP: u32 = 16;
 
 // After typing injected text (task or auto-advance follow-up) into an agent's
 // input box, wait this long, then send Enter as a SEPARATE keystroke. TUIs like
@@ -383,6 +393,11 @@ impl Shell {
         let advance_enabled = !advance_followups.is_empty();
         let mut advance_idx: usize = 0;
         let mut last_advance = start;
+        // Backoff state for unconsumed nudges (see AUTO_ADVANCE_PROGRESS_BYTES):
+        // bytes the agent emitted since the last nudge, and the idle multiplier
+        // the next nudge needs while the previous one sits unconsumed.
+        let mut bytes_since_advance: usize = 0;
+        let mut advance_backoff: u32 = 2;
         let advance_idle = std::env::var("MT_AUTO_ADVANCE_IDLE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -401,6 +416,9 @@ impl Shell {
                 if track_output {
                     last_output = Instant::now();
                     saw_output = true;
+                }
+                if advance_enabled {
+                    bytes_since_advance = bytes_since_advance.saturating_add(chunk.len());
                 }
                 if scan_active {
                     tail.extend_from_slice(&chunk);
@@ -555,6 +573,12 @@ impl Shell {
             // so the normal idle window applies.
             let needed_idle = if advance_idx == 0 {
                 advance_idle.saturating_mul(2)
+            } else if bytes_since_advance < AUTO_ADVANCE_PROGRESS_BYTES {
+                // The previous nudge wasn't consumed — only our own keystroke
+                // echo came back. The agent is mid-silent-work, not idle at
+                // its input: back off so a long quiet tool call drains the
+                // ladder logarithmically, not one nudge per idle window.
+                advance_idle.saturating_mul(advance_backoff)
             } else {
                 advance_idle
             };
@@ -578,6 +602,16 @@ impl Shell {
                 ));
                 advance_idx += 1;
                 last_advance = Instant::now();
+                // Escalate or reset the unconsumed-nudge backoff: this nudge
+                // fired into silence → the next waits twice as long (capped);
+                // the agent visibly worked since the last one → back to base.
+                if advance_idx > 1 && bytes_since_advance < AUTO_ADVANCE_PROGRESS_BYTES {
+                    advance_backoff =
+                        advance_backoff.saturating_mul(2).min(AUTO_ADVANCE_BACKOFF_CAP);
+                } else {
+                    advance_backoff = 2;
+                }
+                bytes_since_advance = 0;
                 // Owe a separate Enter to submit the follow-up (see pending_submit).
                 pending_submit = Some(Instant::now());
                 // Reset idle + prompt-detection state so the next nudge waits for
